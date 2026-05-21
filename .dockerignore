@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+venv
+env
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+traces/*.jsonl
+evals/reports/*.md
+data/memory.sqlite*
+.env
+.idea
+.vscode

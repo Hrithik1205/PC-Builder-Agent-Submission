@@ -1,0 +1,66 @@
+scenarios:
+  - id: gaming_1500
+    name: "Gaming PC at $1500"
+    message: "Build me a gaming PC for $1500 for 1440p gaming."
+    expected:
+      should_produce_build: true
+      max_total_price: 1650
+      min_total_price: 1000
+      required_categories: [cpu, motherboard, memory, video_card, storage, power_supply, case]
+      min_memory_gb: 16
+      min_psu_watts: 550
+      must_have_discrete_gpu: true
+      no_compatibility_errors: true
+
+  - id: office_700
+    name: "Office PC at $700"
+    message: "Build me a quiet office PC for $700 - I just need Word, Excel, and Zoom."
+    expected:
+      should_produce_build: true
+      max_total_price: 780
+      min_total_price: 400
+      required_categories: [cpu, motherboard, memory, storage, power_supply, case]
+      min_memory_gb: 16
+      must_have_discrete_gpu: false
+      no_compatibility_errors: true
+
+  - id: creator_2500
+    name: "Video editing rig at $2500"
+    message: "Need a video editing PC for $2500. I edit 4K footage in DaVinci Resolve."
+    expected:
+      should_produce_build: true
+      max_total_price: 2750
+      min_total_price: 1800
+      required_categories: [cpu, motherboard, memory, video_card, storage, power_supply, case]
+      min_memory_gb: 32
+      min_storage_gb: 1000
+      must_have_discrete_gpu: true
+      no_compatibility_errors: true
+
+  - id: infeasible_gaming_300
+    name: "Infeasible: gaming PC at $300"
+    message: "Build me a gaming PC for $300."
+    expected:
+      should_produce_build: false_or_warn
+      response_must_mention_any_of:
+        - "budget"
+        - "minimum"
+        - "not enough"
+        - "too low"
+        - "infeasible"
+        - "challenging"
+        - "tight"
+        - "limit"
+
+  - id: feedback_quieter
+    name: "Feedback loop: make it quieter"
+    initial_message: "Build me a gaming PC for $1500."
+    feedback_message: "Make it quieter please."
+    expected:
+      should_produce_build: true
+      no_compatibility_errors: true
+      response_must_mention_any_of:
+        - "quiet"
+        - "noise"
+        - "low-noise"
+        - "silent"

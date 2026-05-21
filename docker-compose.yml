@@ -1,0 +1,56 @@
+version: "3.9"
+
+# Two services:
+#   ollama - the local LLM runtime (open-source MIT)
+#   app    - the PC Builder Agent (Streamlit UI by default)
+#
+# First run will download the Qwen2.5 7B Instruct model (~5 GB) into the
+# `ollama` named volume.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pc-builder-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # On startup, ensure the configured model is pulled. We do this inline so
+    # the user doesn't have to remember to run `ollama pull` after compose up.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        /bin/ollama serve &
+        SERVER_PID=$$!
+        # Wait for server
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        ollama pull qwen2.5:7b-instruct || true
+        ollama pull phi3:mini || true
+        wait $$SERVER_PID
+
+  app:
+    build: .
+    container_name: pc-builder-app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen2.5:7b-instruct
+      - OLLAMA_FALLBACK_MODEL=phi3:mini
+      - LLM_PROVIDER=ollama
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./traces:/app/traces
+      - ./data:/app/data
+      - ./evals/reports:/app/evals/reports
+
+volumes:
+  ollama_models:

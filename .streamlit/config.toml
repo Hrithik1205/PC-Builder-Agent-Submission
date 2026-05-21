@@ -1,0 +1,8 @@
+[server]
+# OneDrive / synced folders cause endless reload loops on Windows
+fileWatcherType = "none"
+runOnSave = false
+headless = true
+
+[browser]
+gatherUsageStats = false
