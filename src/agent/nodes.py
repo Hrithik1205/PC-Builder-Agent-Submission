@@ -317,15 +317,64 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
     ):
         return {
             "intent": "swap_part",
-            "delta_constraints": {"chipset_contains": "nvidia"},
+            "delta_constraints": {
+                "chipset_contains": "nvidia",
+                "gpu_brand_preference": "nvidia",
+            },
             "target_categories": ["video_card"],
         }
     if any(s in t for s in ("amd gpu", "radeon")):
         return {
             "intent": "swap_part",
-            "delta_constraints": {"chipset_contains": "radeon"},
+            "delta_constraints": {
+                "chipset_contains": "radeon",
+                "gpu_brand_preference": "amd",
+            },
             "target_categories": ["video_card"],
         }
+
+    # ---- CPU brand swaps ----
+    # Trigger when the user mentions AMD/Intel near a CPU-related keyword
+    # OR uses Ryzen / Core (which are unambiguously CPU brand markers).
+    # Examples: "i want AMD cpu not intel", "swap Intel cpu with AMD",
+    # "give me ryzen instead", "use intel processor".
+    cpu_kw = re.search(r"\b(cpu|processor|ryzen|core\s?i\d|core\s?ultra)\b", t)
+    has_amd = re.search(r"\b(amd|ryzen)\b", t) is not None
+    has_intel = re.search(r"\b(intel|core\s?i\d|core\s?ultra)\b", t) is not None
+    if cpu_kw or has_amd or has_intel:
+        # Prefer AMD if the user wrote "amd ... not intel" or "amd instead",
+        # or if only AMD markers are present.
+        wants_amd = (
+            has_amd and (
+                re.search(r"\bnot\s+intel\b", t) or
+                "instead" in t or "rather" in t or
+                "swap" in t or "replace" in t or "change" in t or
+                "switch" in t or "want" in t or "prefer" in t or
+                not has_intel
+            )
+        )
+        wants_intel = (
+            has_intel and not wants_amd and (
+                re.search(r"\bnot\s+amd\b", t) or
+                "instead" in t or
+                "want" in t or "prefer" in t or
+                not has_amd
+            )
+        )
+        if wants_amd:
+            return {
+                "intent": "swap_part",
+                "delta_constraints": {"cpu_brand_preference": "amd"},
+                # Motherboard socket and memory DDR generation change with
+                # the CPU brand, so they must be re-picked too.
+                "target_categories": ["cpu", "motherboard", "memory"],
+            }
+        if wants_intel:
+            return {
+                "intent": "swap_part",
+                "delta_constraints": {"cpu_brand_preference": "intel"},
+                "target_categories": ["cpu", "motherboard", "memory"],
+            }
 
     # ---- Generic "change X" requests ----
     component_synonyms = {
@@ -364,6 +413,23 @@ def _heuristic_requirements(user_text: str, base: Dict[str, Any]) -> Dict[str, A
         uc = _heuristic_use_case(user_text)
         if uc:
             base["use_case"] = uc
+    # Detect brand preferences expressed in the initial message itself
+    # (e.g. "I want an AMD gaming PC", "Intel build please").
+    if not base.get("cpu_brand_preference"):
+        tt = user_text.lower()
+        # Trigger on a bare brand mention - the user almost never types AMD
+        # or Intel without meaning the CPU brand. (GPU brand is detected
+        # separately below.)
+        if re.search(r"\b(amd|ryzen)\b", tt) and "amd gpu" not in tt and "radeon" not in tt:
+            base["cpu_brand_preference"] = "amd"
+        elif re.search(r"\b(intel|core\s?i\d|core\s?ultra)\b", tt):
+            base["cpu_brand_preference"] = "intel"
+    if not base.get("gpu_brand_preference"):
+        tt = user_text.lower()
+        if re.search(r"\b(nvidia|geforce|rtx|gtx)\b", tt):
+            base["gpu_brand_preference"] = "nvidia"
+        elif "radeon" in tt or "amd gpu" in tt:
+            base["gpu_brand_preference"] = "amd"
     if base.get("budget_usd") and base.get("use_case") not in (None, "general"):
         base["confidence"] = "high"
         base["clarifying_questions"] = []
@@ -386,6 +452,7 @@ def _merge_requirements(prev: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, 
     SCALAR_KEYS = (
         "is_on_topic", "use_case", "budget_usd", "budget_min_usd",
         "budget_flexible", "noise_preference", "form_factor_preference",
+        "cpu_brand_preference", "gpu_brand_preference",
         "os_needed",
     )
     for k in SCALAR_KEYS:
@@ -493,6 +560,8 @@ def requirement_gatherer(state: AgentState) -> Dict[str, Any]:
         "budget_flexible": bool(parsed.get("budget_flexible", False)),
         "noise_preference": parsed.get("noise_preference"),
         "form_factor_preference": parsed.get("form_factor_preference", "any"),
+        "cpu_brand_preference": parsed.get("cpu_brand_preference"),
+        "gpu_brand_preference": parsed.get("gpu_brand_preference"),
         "os_needed": bool(parsed.get("os_needed", False)),
         "peripherals_needed": parsed.get("peripherals_needed", []) or [],
         "must_have": parsed.get("must_have", []) or [],
@@ -615,10 +684,18 @@ def _fallback_plan(reqs: Dict[str, Any]) -> Dict[str, Any]:
     }
     if is_creator:
         allocation["memory"] = budget * 0.15
+    # AMD -> AM5, Intel -> LGA1700, otherwise "ANY" so the picker can roam.
+    cpu_brand = (reqs.get("cpu_brand_preference") or "").lower()
+    if cpu_brand == "amd":
+        platform = "AM5"
+    elif cpu_brand == "intel":
+        platform = "LGA1700"
+    else:
+        platform = "ANY"
     return {
         "reasoning": "Fallback heuristic allocation (LLM plan was unparseable).",
         "performance_tier": "mainstream",
-        "platform_preference": "AM5",
+        "platform_preference": platform,
         "budget_allocation": allocation,
         "constraints": [],
         "warnings": [],
@@ -653,12 +730,34 @@ def _pick_cpu(plan: Dict[str, Any], reqs: Dict[str, Any], build: Dict[str, Any])
         filters["socket"] = platform
     if need_igpu:
         filters["has_integrated_graphics"] = True
+    # Honor an explicit CPU brand preference (e.g. "I want AMD, not Intel").
+    # The CSV's `name` column starts with the brand ("AMD Ryzen ..." /
+    # "Intel Core ..."), so a substring match on it is a reliable filter.
+    brand = (reqs.get("cpu_brand_preference") or "").lower()
+    if brand in ("amd", "intel"):
+        filters["name_contains"] = brand.upper() if brand == "amd" else "Intel"
+        # AMD CPUs live on AM4/AM5; Intel on LGA. If the planner fixed a
+        # platform_preference that conflicts with the brand (e.g. AM5 + Intel),
+        # drop the socket filter so the picker can find a real candidate.
+        if "socket" in filters:
+            soc = str(filters["socket"]).upper()
+            if (brand == "amd" and soc.startswith("LGA")) or (
+                brand == "intel" and soc.startswith("AM")
+            ):
+                filters.pop("socket", None)
     # Sort by core_count desc within budget - "the most cores you can afford"
     results = search_components_impl("cpu", filters=filters,
                                      sort_by="core_count", ascending=False, top_k=10)
     if not results and platform != "ANY":
         # Relax platform constraint
         filters.pop("socket", None)
+        results = search_components_impl("cpu", filters=filters,
+                                         sort_by="core_count", ascending=False, top_k=10)
+    if not results and brand:
+        # Brand preference left zero matches - relax it as a last resort
+        # rather than failing the build.
+        filters.pop("name_contains", None)
+        log.info("node.select.brand_relaxed", brand=brand, category="cpu")
         results = search_components_impl("cpu", filters=filters,
                                          sort_by="core_count", ascending=False, top_k=10)
     if not results:
@@ -732,12 +831,23 @@ def _pick_video_card(plan, reqs, build) -> Dict[str, Any] | None:
     if not _need_discrete_gpu(reqs):
         return None
     budget = plan["budget_allocation"]["video_card"] * 1.15
-    filters = {"price_lte": budget, "price_gte": 80}
+    filters: Dict[str, Any] = {"price_lte": budget, "price_gte": 80}
+    # Honor an explicit GPU brand preference (chipset column carries the
+    # marketing name, e.g. "GeForce RTX 4070" or "Radeon RX 7800 XT").
+    gbrand = (reqs.get("gpu_brand_preference") or "").lower()
+    if gbrand == "nvidia":
+        filters["chipset_contains"] = "GeForce"
+    elif gbrand == "amd":
+        filters["chipset_contains"] = "Radeon"
     results = search_components_impl("video_card", filters=filters,
                                      sort_by="estimated_tdp", ascending=False, top_k=10)
+    if not results and gbrand:
+        filters.pop("chipset_contains", None)
+        log.info("node.select.brand_relaxed", brand=gbrand, category="video_card")
+        results = search_components_impl("video_card", filters=filters,
+                                         sort_by="estimated_tdp", ascending=False, top_k=10)
     if not results:
         return None
-    # Most performant under budget that also actually exists in catalog
     return results[0]
 
 
@@ -1632,6 +1742,7 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
     KNOWN_FIELD_DELTAS = {
         "budget_usd", "budget_min_usd", "noise_preference", "use_case",
         "form_factor_preference", "os_needed",
+        "cpu_brand_preference", "gpu_brand_preference",
     }
     for k in KNOWN_FIELD_DELTAS:
         if k in deltas and deltas[k] is not None:

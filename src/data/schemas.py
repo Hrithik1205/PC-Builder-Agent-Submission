@@ -149,6 +149,14 @@ class Requirements(BaseModel):
     budget_flexible: bool = Field(default=False, description="Whether user is open to slight overspend")
     noise_preference: Optional[Literal["quiet", "balanced", "performance"]] = None
     form_factor_preference: Optional[Literal["mini_itx", "micro_atx", "atx", "any"]] = "any"
+    cpu_brand_preference: Optional[Literal["amd", "intel"]] = Field(
+        default=None,
+        description="User-preferred CPU brand: 'amd', 'intel', or None for either"
+    )
+    gpu_brand_preference: Optional[Literal["nvidia", "amd"]] = Field(
+        default=None,
+        description="User-preferred GPU brand: 'nvidia', 'amd' (Radeon), or None"
+    )
     os_needed: bool = False
     peripherals_needed: List[str] = Field(default_factory=list)
     must_have: List[str] = Field(default_factory=list)
