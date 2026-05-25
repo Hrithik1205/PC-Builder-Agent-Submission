@@ -282,8 +282,43 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
             "target_categories": [],
         }
 
-    # "make it cheaper" / "more expensive" - relative budget
-    if has_word("cheaper") or any(s in t for s in ("less expensive", "lower price")):
+    # "make it cheaper" / "more expensive" - relative budget.
+    # We also detect category-scoped versions like "less expensive cpu",
+    # "cheaper gpu", "less ram" - these should drop just that category and
+    # re-pick a cheaper option instead of shrinking the whole budget (which
+    # would be wasteful if everything else is already fine).
+    CATEGORY_KEYWORDS = {
+        "cpu": ("cpu", "processor"),
+        "video_card": ("gpu", "video card", "graphics card", "graphics"),
+        "memory": ("ram", "memory"),
+        "storage": ("ssd", "storage", "drive", "hdd", "nvme"),
+        "motherboard": ("motherboard", "mobo", "mainboard"),
+        "power_supply": ("psu", "power supply"),
+        "case": ("case", "chassis", "tower"),
+        "cpu_cooler": ("cooler", "heatsink"),
+    }
+    cheaper_signal = (
+        has_word("cheaper") or any(
+            s in t for s in ("less expensive", "lower price", "lower cost", "less cost")
+        )
+    )
+    less_only_signal = (
+        cheaper_signal
+        or has_word("less")  # "less cpu", "less ram"
+        or "lower " in t
+        or "smaller " in t  # "smaller storage" -> cheaper storage
+    )
+    if less_only_signal:
+        # Find a category mentioned alongside the cheap-signal word.
+        for cat, kws in CATEGORY_KEYWORDS.items():
+            if any(re.search(rf"\b{re.escape(kw)}\b", t) for kw in kws):
+                return {
+                    "intent": "swap_part",
+                    "delta_constraints": {"price_lower_category": cat},
+                    "target_categories": [cat],
+                }
+    # No category mentioned - apply to the whole build.
+    if cheaper_signal:
         return {
             "intent": "swap_part",
             "delta_constraints": {"price_lower": True},
@@ -740,8 +775,21 @@ def _need_discrete_gpu(reqs: Dict[str, Any]) -> bool:
     return False
 
 
+def _category_price_ceiling(reqs: Dict[str, Any], category: str,
+                            default_budget: float) -> float:
+    """Honor a user-requested per-category price cap ('less expensive cpu')
+    by clamping the effective per-category budget.
+    """
+    ceilings = reqs.get("category_price_ceilings") or {}
+    cap = ceilings.get(category)
+    if cap is not None:
+        return min(float(cap), default_budget)
+    return default_budget
+
+
 def _pick_cpu(plan: Dict[str, Any], reqs: Dict[str, Any], build: Dict[str, Any]) -> Dict[str, Any] | None:
     budget = plan["budget_allocation"]["cpu"] * 1.15  # 15% per-category slack
+    budget = _category_price_ceiling(reqs, "cpu", budget)
     platform = (plan.get("platform_preference") or "any").upper()
     need_igpu = not _need_discrete_gpu(reqs)
     filters: Dict[str, Any] = {"price_lte": budget, "price_gte": 50}
@@ -793,6 +841,7 @@ def _pick_motherboard(plan, reqs, build) -> Dict[str, Any] | None:
         return None
     socket = build["cpu"].get("socket")
     budget = plan["budget_allocation"]["motherboard"] * 1.2
+    budget = _category_price_ceiling(reqs, "motherboard", budget)
     filters: Dict[str, Any] = {"price_lte": budget, "price_gte": 50, "socket": socket}
     form_pref = (reqs.get("form_factor_preference") or "any").lower()
     if form_pref == "mini_itx":
@@ -818,31 +867,52 @@ def _pick_memory(plan, reqs, build) -> Dict[str, Any] | None:
         return None
     ddr = build["motherboard"].get("ddr_gen")
     budget = plan["budget_allocation"]["memory"] * 1.2
-    target_gb = 32 if reqs.get("use_case") in ("content_creation", "workstation") else 16
-    # Allow >= target_gb up to max board capacity
-    max_mem = build["motherboard"].get("max_memory") or 64
+    budget = _category_price_ceiling(reqs, "memory", budget)
+    # Per-use-case target: do not overshoot. Picking the largest kit that fits
+    # is wasteful for low-budget office/browsing builds (32 GB for $300
+    # browsing PC pushes the total well over budget).
+    use_case = reqs.get("use_case", "general")
+    if use_case in ("content_creation", "workstation"):
+        target_gb, hard_cap_gb = 32, 64
+    elif use_case == "gaming":
+        target_gb, hard_cap_gb = 16, 32
+    else:  # office / general / browsing
+        target_gb, hard_cap_gb = 16, 16
+    # Allow >= target_gb up to the smaller of the board's max and our hard cap.
+    max_mem = min(build["motherboard"].get("max_memory") or 64, hard_cap_gb)
     filters: Dict[str, Any] = {
         "price_lte": budget,
         "ddr_gen": ddr,
         "total_gb_gte": target_gb,
         "total_gb_lte": max_mem,
     }
-    # Slot constraint
     slots = build["motherboard"].get("memory_slots")
     if slots:
         filters["module_count_lte"] = slots
+    # Sort by price ASC and pick the cheapest kit that meets target_gb. This
+    # respects the user's needs without over-spec'ing memory.
     results = search_components_impl("memory", filters=filters,
-                                     sort_by="total_gb", ascending=False, top_k=10)
+                                     sort_by="price", ascending=True, top_k=10)
+    if not results:
+        # Fallback: relax the upper cap (some boards report no max_memory)
+        filters.pop("total_gb_lte", None)
+        results = search_components_impl("memory", filters=filters,
+                                         sort_by="price", ascending=True, top_k=10)
     if not results:
         filters.pop("total_gb_gte", None)
         results = search_components_impl("memory", filters=filters,
-                                         sort_by="total_gb", ascending=False, top_k=10)
+                                         sort_by="price", ascending=True, top_k=10)
     if not results:
         return None
-    # Prefer the kit with most total_gb within budget, then lower CL
+    # Among the cheapest 5, prefer the one closest to target_gb (not over it)
+    # then lower CAS latency.
+    top = results[:5]
     return sorted(
-        results,
-        key=lambda r: (-(r.get("total_gb") or 0), r.get("cas_latency") or 99),
+        top,
+        key=lambda r: (
+            abs((r.get("total_gb") or 0) - target_gb),
+            r.get("cas_latency") or 99,
+        ),
     )[0]
 
 
@@ -850,6 +920,7 @@ def _pick_video_card(plan, reqs, build) -> Dict[str, Any] | None:
     if not _need_discrete_gpu(reqs):
         return None
     budget = plan["budget_allocation"]["video_card"] * 1.15
+    budget = _category_price_ceiling(reqs, "video_card", budget)
     filters: Dict[str, Any] = {"price_lte": budget, "price_gte": 80}
     # Honor an explicit GPU brand preference (chipset column carries the
     # marketing name, e.g. "GeForce RTX 4070" or "Radeon RX 7800 XT").
@@ -872,6 +943,7 @@ def _pick_video_card(plan, reqs, build) -> Dict[str, Any] | None:
 
 def _pick_storage(plan, reqs, build) -> Dict[str, Any] | None:
     budget = plan["budget_allocation"]["storage"] * 1.2
+    budget = _category_price_ceiling(reqs, "storage", budget)
     target = 1000 if reqs.get("use_case") in ("content_creation", "workstation") else 500
     filters = {
         "price_lte": budget,
@@ -896,6 +968,7 @@ def _pick_psu(plan, reqs, build) -> Dict[str, Any] | None:
     build_obj = _build_obj(build)
     needed = max(450, estimate_load_watts(build_obj))
     budget = plan["budget_allocation"]["power_supply"] * 1.3
+    budget = _category_price_ceiling(reqs, "power_supply", budget)
     filters = {"price_lte": budget, "wattage_gte": needed}
     results = search_components_impl("power_supply", filters=filters,
                                      sort_by="wattage", ascending=True, top_k=10)
@@ -911,6 +984,7 @@ def _pick_case(plan, reqs, build) -> Dict[str, Any] | None:
     if not build.get("motherboard"):
         return None
     budget = plan["budget_allocation"]["case"] * 1.3
+    budget = _category_price_ceiling(reqs, "case", budget)
     form = (build["motherboard"].get("form_factor") or "").strip()
     # Pick a case `type` that supports this form factor.
     if form == "Mini ITX":
@@ -930,6 +1004,7 @@ def _pick_case(plan, reqs, build) -> Dict[str, Any] | None:
 
 def _pick_cooler(plan, reqs, build) -> Dict[str, Any] | None:
     budget = plan["budget_allocation"]["cpu_cooler"] * 1.5
+    budget = _category_price_ceiling(reqs, "cpu_cooler", budget)
     filters = {"price_lte": budget}
     results = search_components_impl("cpu_cooler", filters=filters,
                                      sort_by="price", ascending=True, top_k=10)
@@ -991,7 +1066,12 @@ def _pick_relaxed(
         )
         return results[0] if results else None
 
-    if cat == "video_card" and _need_discrete_gpu(reqs):
+    if cat == "video_card":
+        # Office / browsing / general builds use the CPU's iGPU - never
+        # silently slip a discrete GPU into them just because the strict
+        # picker returned None.
+        if not _need_discrete_gpu(reqs):
+            return None
         results = search_components_impl(
             "video_card",
             filters={"price_lte": headroom, "price_gte": 50},
@@ -1163,6 +1243,170 @@ def _budget_fill_pass(build: Dict[str, Any], plan: Dict[str, Any],
     return build
 
 
+# ---------------------------------------------------------------------------
+# Budget-trim pass: downgrade components when the build overshoots the budget
+# ---------------------------------------------------------------------------
+
+def _try_downgrade(category: str, current: Dict[str, Any], max_price: float,
+                   plan: Dict[str, Any], reqs: Dict[str, Any],
+                   build: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Find a cheaper component for this category that stays compatible.
+
+    `max_price` is the highest price we'll accept. We pick the closest item
+    below that ceiling so we don't downgrade more than necessary.
+    """
+    cur_price = float(current.get("price", 0) or 0)
+    if max_price >= cur_price - 1:
+        return None  # nothing meaningful to gain
+
+    if category == "cpu":
+        platform = (plan.get("platform_preference") or "any").upper()
+        need_igpu = not _need_discrete_gpu(reqs)
+        filters: Dict[str, Any] = {"price_lte": max_price, "price_gte": 40}
+        if platform != "ANY":
+            filters["socket"] = platform
+        if need_igpu:
+            filters["has_integrated_graphics"] = True
+        brand = (reqs.get("cpu_brand_preference") or "").lower()
+        if brand in ("amd", "intel"):
+            filters["name_contains"] = brand.upper() if brand == "amd" else "Intel"
+        results = search_components_impl(
+            "cpu", filters=filters, sort_by="core_count", ascending=False, top_k=5
+        )
+        if not results and platform != "ANY":
+            filters.pop("socket", None)
+            results = search_components_impl(
+                "cpu", filters=filters, sort_by="core_count", ascending=False, top_k=5
+            )
+        return results[0] if results else None
+
+    if category == "memory" and build.get("motherboard"):
+        ddr = build["motherboard"].get("ddr_gen")
+        # Keep at least the use-case-appropriate floor (16GB office, 8GB browsing).
+        target_gb = 32 if reqs.get("use_case") in ("content_creation", "workstation") else 16
+        filters = {"price_lte": max_price, "total_gb_gte": target_gb}
+        if ddr:
+            filters["ddr_gen"] = ddr
+        results = search_components_impl(
+            "memory", filters=filters, sort_by="total_gb", ascending=True, top_k=5
+        )
+        return results[0] if results else None
+
+    if category == "storage":
+        # Floor: 256 GB - anything below that isn't usable in 2025.
+        results = search_components_impl(
+            "storage",
+            filters={"price_lte": max_price, "capacity_gte": 256},
+            sort_by="price", ascending=False, top_k=5,
+        )
+        return results[0] if results else None
+
+    if category == "video_card":
+        # If iGPU is fine, the better downgrade is to remove the GPU entirely
+        # - signal that with None and let the caller delete it.
+        if not _need_discrete_gpu(reqs):
+            return None  # caller handles removal
+        results = search_components_impl(
+            "video_card",
+            filters={"price_lte": max_price, "price_gte": 50},
+            sort_by="estimated_tdp", ascending=False, top_k=5,
+        )
+        return results[0] if results else None
+
+    # Generic: pick the most expensive thing that still fits the new ceiling
+    # (so we downgrade minimally).
+    results = search_components_impl(
+        category,
+        filters={"price_lte": max_price},
+        sort_by="price", ascending=False, top_k=5,
+    )
+    return results[0] if results else None
+
+
+def _budget_trim_pass(build: Dict[str, Any], plan: Dict[str, Any],
+                      reqs: Dict[str, Any]) -> Dict[str, Any]:
+    """Downgrade components iteratively until total <= budget.
+
+    Strategy:
+    1. If the build has a discrete GPU but iGPU is sufficient, drop the GPU
+       (single biggest win - usually saves $50+).
+    2. Otherwise, find the most expensive non-critical component, replace it
+       with the next-cheapest compatible alternative. Repeat until in budget
+       or no more cuts possible.
+    """
+    budget = float(reqs.get("budget_usd") or 0)
+    if not budget:
+        return build
+
+    def total_now() -> float:
+        return round(sum(float(c.get("price", 0) or 0) for c in build.values() if c), 2)
+
+    if total_now() <= budget:
+        return build
+
+    # Step 1: drop discrete GPU if iGPU works for this use case.
+    if build.get("video_card") and not _need_discrete_gpu(reqs):
+        gpu_price = float(build["video_card"].get("price", 0) or 0)
+        log.info(
+            "node.select.trim_drop_gpu",
+            name=build["video_card"].get("name"),
+            saved=round(gpu_price, 2),
+        )
+        build.pop("video_card", None)
+        if total_now() <= budget:
+            return build
+
+    # Step 2: iteratively downgrade the highest-priced category.
+    # Order: try the most flexible categories first - cpu_cooler, case,
+    # power_supply, memory, storage, cpu, motherboard. We avoid touching
+    # the motherboard unless we have to (changing it cascades to cpu).
+    PREFER_ORDER = (
+        "cpu_cooler", "case", "power_supply", "video_card",
+        "memory", "storage", "cpu",
+    )
+    max_iters = 12
+    for _i in range(max_iters):
+        over = total_now() - budget
+        if over <= 0:
+            return build
+        # Pick the highest-priced flexible category that still has room to cut.
+        target_cat: str | None = None
+        target_price = 0.0
+        for cat in PREFER_ORDER:
+            comp = build.get(cat)
+            if not comp:
+                continue
+            p = float(comp.get("price", 0) or 0)
+            if p > target_price and p > 15:  # nothing below $15 is worth trimming
+                target_cat = cat
+                target_price = p
+        if not target_cat:
+            break
+
+        max_price = max(15.0, target_price - over - 1)  # absorb the full overage
+        new_pick = _try_downgrade(
+            target_cat, build[target_cat], max_price, plan, reqs, build
+        )
+        if not new_pick or new_pick.get("name") == build[target_cat].get("name"):
+            # No cheaper alternative for this category. Skip it next round
+            # by temporarily dropping its price contribution from consideration.
+            log.info("node.select.trim_no_cheaper", category=target_cat)
+            # Mark as immovable for this loop by tagging name (handled by
+            # checking equality above on next iteration is unreliable, so
+            # break to avoid infinite loop if every category is at floor).
+            break
+        log.info(
+            "node.select.budget_trim",
+            category=target_cat,
+            old=build[target_cat].get("name"),
+            new=new_pick.get("name"),
+            delta=round(float(new_pick.get("price", 0) or 0) - target_price, 2),
+        )
+        build[target_cat] = new_pick
+
+    return build
+
+
 def component_selector(state: AgentState) -> Dict[str, Any]:
     """Deterministic per-category picker that consults the search tool.
 
@@ -1206,6 +1450,10 @@ def component_selector(state: AgentState) -> Dict[str, Any]:
     # critique-driven re-pick.
     if attempts == 1:
         build = _budget_fill_pass(build, plan, reqs)
+    # If the build overshoots the user's budget, the agent (not the user)
+    # should bring it back in line. This runs on every attempt because a
+    # critique-driven re-pick can also bust the budget.
+    build = _budget_trim_pass(build, plan, reqs)
 
     log.info(
         "node.select.done",
@@ -1739,23 +1987,50 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
 
     # Apply deltas to requirements + plan, then re-plan from scratch.
     reqs = dict(state.get("requirements") or {})
+    # Per-category price ceilings are one-shot - clear any left over from a
+    # previous turn so they do not silently keep capping picks forever.
+    reqs.pop("category_price_ceilings", None)
     deltas = fb.get("delta_constraints") or {}
 
     # Translate the relative "make it cheaper" signal into a concrete
-    # budget reduction (target ~80% of the current build's total, or 80%
-    # of the existing budget if no build exists yet).
+    # budget reduction. Target ~80% of the LOWER of (current build total,
+    # current budget) so we never accidentally raise the budget when the
+    # previous build overshot it.
     if deltas.get("price_lower"):
         current_total = sum(
             float(c.get("price", 0) or 0)
             for c in (state.get("build") or {}).values() if c
         )
-        anchor = current_total or float(reqs.get("budget_usd") or 0) or 0
+        cur_budget = float(reqs.get("budget_usd") or 0)
+        # Use the smaller of the two so a previous over-budget build does not
+        # become the new ceiling. If only one is set, use that.
+        candidates = [v for v in (current_total, cur_budget) if v > 0]
+        anchor = min(candidates) if candidates else 0
         if anchor > 0:
             reqs["budget_usd"] = round(anchor * 0.80, 2)
             reqs.pop("budget_min_usd", None)
             log.info("node.feedback.price_lower_anchor",
-                     anchor=anchor, new_budget=reqs["budget_usd"])
+                     current_total=round(current_total, 2),
+                     current_budget=cur_budget,
+                     anchor=anchor,
+                     new_budget=reqs["budget_usd"])
         deltas.pop("price_lower", None)
+
+    # "less expensive <category>" - cap that one category's price at 80% of
+    # its current pick (so the new pick is meaningfully cheaper without
+    # shrinking the whole budget). Stored on reqs so the per-category picker
+    # can honor it.
+    if deltas.get("price_lower_category"):
+        cat = deltas.pop("price_lower_category")
+        cur = (state.get("build") or {}).get(cat) or {}
+        cur_price = float(cur.get("price", 0) or 0)
+        if cur_price > 0:
+            ceilings = dict(reqs.get("category_price_ceilings") or {})
+            ceilings[cat] = round(cur_price * 0.80, 2)
+            reqs["category_price_ceilings"] = ceilings
+            log.info("node.feedback.category_price_ceiling",
+                     category=cat, old_price=cur_price,
+                     new_ceiling=ceilings[cat])
 
     # Structured deltas - apply directly to Requirements fields.
     KNOWN_FIELD_DELTAS = {
