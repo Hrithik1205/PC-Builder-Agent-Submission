@@ -114,12 +114,17 @@ def _make_github(temperature: float, model: str, **kwargs: Any):
         temperature=temperature,
         ssl_verify=settings.data_ssl_verify,
     )
+    # IMPORTANT: pass max_tokens explicitly. Without it, langchain-openai
+    # routes the request through code paths that, for non-standard models,
+    # can end up sending a small default (we saw ~16 tokens). Setting it to
+    # 2048 leaves plenty of room for full Markdown responses with tables.
     return ChatOpenAI(
         model=model,
         temperature=temperature,
         api_key=settings.github_token,
         base_url=settings.github_models_base_url,
         timeout=settings.llm_timeout_s,
+        max_tokens=2048,
         **_httpx_clients_for_corp_proxy(),
         **kwargs,
     )
@@ -157,6 +162,7 @@ def _make_cerebras(temperature: float, model: str, **kwargs: Any):
         api_key=settings.cerebras_api_key,
         base_url=settings.cerebras_base_url,
         timeout=settings.llm_timeout_s,
+        max_tokens=2048,
         **_httpx_clients_for_corp_proxy(),
         **kwargs,
     )
