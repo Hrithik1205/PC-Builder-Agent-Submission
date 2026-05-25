@@ -48,24 +48,44 @@ Schema:
 }
 
 Rules:
-- TOPIC GATE: set is_on_topic=false if the message has NOTHING to do with
-  computer hardware, PC builds, components, gaming hardware, workstations,
-  servers, or peripherals. Examples that ARE on-topic: "build me a PC",
-  "compare two GPUs", "what RAM is best for AM5", "make it quieter".
+- TOPIC GATE: set is_on_topic=false ONLY if the message has NOTHING to do
+  with computer hardware. If the message mentions ANY of: PC, computer,
+  build, gaming, workstation, server, CPU, GPU, RAM, memory, motherboard,
+  PSU, SSD, NVMe, case, cooler, tower, AMD, Intel, Nvidia, Ryzen, GeForce,
+  Radeon, storage, 1080p/1440p/4K, fps, render, edit, stream - then
+  is_on_topic IS true, regardless of any other qualifier ("personal",
+  "home", "everyday", "small", "cheap"). Examples that ARE on-topic:
+  "build me a PC", "Personal PC with 512 GB storage", "I want a small
+  computer for browsing", "compare two GPUs", "make it quieter".
   Examples that are NOT on-topic: "what's the weather", "tell me a joke",
   "write me a poem", "what is 2+2", "translate this to French", "who won
   the world cup". When is_on_topic=false, leave all other fields at safe
   defaults (use_case="general", budget_usd=null, confidence="low") and
   leave clarifying_questions=[]. The agent will emit a standard refusal.
+- USE CASE NORMALISATION: map natural-language phrases to the closest
+  canonical use_case value, DO NOT leave it as "general" if the user gave
+  any hint:
+    * "personal use", "home use", "everyday", "general use", "basic",
+      "browsing", "internet", "study", "school", "social media",
+      "casual" -> "office"
+    * "gaming", "1440p", "1080p gaming", "esports", "competitive" -> "gaming"
+    * "video editing", "Premiere", "DaVinci", "Blender", "rendering",
+      "streaming", "content creation" -> "content_creation"
+    * "CAD", "engineering", "data science", "ML", "machine learning",
+      "Solidworks" -> "workstation"
+    * "Plex", "NAS", "home server", "media server" -> "home_server"
+  Only fall back to "general" if the user said literally nothing about
+  what the PC is for.
 - BUDGET RANGE: when the user gives a range like "$1000-$1500", "1000 to
   1500", "between 800 and 1200", set budget_min_usd=lower bound and
   budget_usd=upper bound. When they give a single number, set budget_usd
   only (leave budget_min_usd null).
 - IGNORE display resolutions (1080p, 1440p, 4K) when looking for a budget.
-- If you have enough info to choose parts confidently, set confidence="high"
-  and leave clarifying_questions empty.
-- If critical info is missing (no budget, vague use case), set confidence="low"
-  and put 1-3 short clarifying questions in clarifying_questions.
+- If you have enough info (use_case + budget) to choose parts confidently,
+  set confidence="high" and leave clarifying_questions empty.
+- If critical info is missing (no budget AND truly no use-case hint), set
+  confidence="low" and put 1-3 short clarifying questions in
+  clarifying_questions.
 - Do NOT ask more than 3 questions. Do NOT ask about colors or cosmetic
   preferences unless the user mentioned them.
 """
@@ -142,6 +162,61 @@ REQUIREMENT_GATHERER_FEWSHOTS = [
                 "What is your total budget in USD?"
             ]
         }
+    },
+    # Multi-turn example: user answers clarifying questions. The LLM MUST
+    # merge the new info with what was given earlier (storage / RAM
+    # constraints, etc.) and produce a complete, high-confidence Requirements
+    # object. Do NOT re-ask the questions you already asked.
+    {
+        "turns": [
+            {
+                "role": "user",
+                "content": "I want a PC with 512 GB storage and 8 GB RAM"
+            },
+            {
+                "role": "assistant",
+                "content": {
+                    "is_on_topic": True,
+                    "use_case": "general",
+                    "budget_usd": None,
+                    "budget_min_usd": None,
+                    "budget_flexible": False,
+                    "noise_preference": None,
+                    "form_factor_preference": "any",
+                    "os_needed": False,
+                    "peripherals_needed": [],
+                    "must_have": ["512 GB storage", "8 GB RAM"],
+                    "nice_to_have": [],
+                    "confidence": "low",
+                    "clarifying_questions": [
+                        "What is your primary use case (gaming, office, content creation, browsing)?",
+                        "What is your total budget in USD?"
+                    ]
+                }
+            },
+            {
+                "role": "user",
+                "content": "i need it for office use and budget is 600 to 700"
+            },
+            {
+                "role": "assistant",
+                "content": {
+                    "is_on_topic": True,
+                    "use_case": "office",
+                    "budget_usd": 700,
+                    "budget_min_usd": 600,
+                    "budget_flexible": False,
+                    "noise_preference": None,
+                    "form_factor_preference": "any",
+                    "os_needed": False,
+                    "peripherals_needed": [],
+                    "must_have": ["512 GB storage", "8 GB RAM"],
+                    "nice_to_have": [],
+                    "confidence": "high",
+                    "clarifying_questions": []
+                }
+            }
+        ]
     }
 ]
 
@@ -309,6 +384,18 @@ Produce a friendly Markdown response that:
    delta (e.g. "Total: $1245 -> $1390 (+$145). Budget: $1300 -> $1500.").
 7. Closes with "Want me to swap anything? Just say what you would like to
    change (cheaper, quieter, smaller, more storage, etc.)."
+
+CRITICAL Markdown formatting rules - follow EXACTLY:
+- The build table must be a real GFM table. After the LAST row of the table
+  (the last line that starts with `|`), insert a SINGLE BLANK LINE before
+  any prose. Without this blank line every following sentence is rendered
+  as a new table row, which looks broken.
+- Likewise insert a blank line BEFORE each `### heading` and BEFORE any
+  bullet list that follows prose.
+- Never put `|` characters in prose sentences (use the word "or" or a dash
+  "-" instead).
+- Never wrap prices in `*...*` or `_..._` - plain dollar amounts like $697.70
+  render correctly, but `*$697.70*` triggers italics that look like LaTeX.
 
 If the build is incomplete or infeasible, explain what is missing and what
 budget would unblock it. Be concise. No emojis.

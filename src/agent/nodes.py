@@ -71,8 +71,24 @@ def _parse_json_safely(text: str) -> Dict[str, Any] | None:
 
 
 def _few_shot_messages(fewshots: List[Dict[str, Any]]):
+    """Build a flat list of HumanMessage / AIMessage from few-shot examples.
+
+    Each example may be a simple `{user, assistant}` pair OR a multi-turn
+    `{turns: [{role, content}, ...]}` sequence (where assistant content can be
+    a dict, which gets serialised to JSON).
+    """
     msgs = []
     for ex in fewshots:
+        if "turns" in ex:
+            for turn in ex["turns"]:
+                content = turn["content"]
+                if isinstance(content, (dict, list)):
+                    content = json.dumps(content, indent=2)
+                if turn["role"] == "user":
+                    msgs.append(HumanMessage(content=content))
+                else:
+                    msgs.append(AIMessage(content=content))
+            continue
         msgs.append(HumanMessage(content=ex["user"]))
         msgs.append(AIMessage(content=json.dumps(ex["assistant"], indent=2)))
     return msgs
@@ -109,8 +125,18 @@ def _extract_budget_range(user_text: str) -> tuple[float | None, float | None]:
             val = float(m.group(1))
             if 150 <= val <= 25000:
                 return None, val
-    # Loose fallback: any 3-5 digit number not followed by 'p' (skip 1440p, 4K).
-    for m in re.finditer(r"(?<!\d)(\d{3,5})(?!p\b)", text, re.IGNORECASE):
+    # Loose fallback: any 3-5 digit number that is NOT immediately followed by
+    # a unit suffix that would make it something other than dollars:
+    #   p     -> 1080p / 1440p resolutions
+    #   gb/tb/mb/kb -> storage or memory capacity (e.g. "512 GB storage")
+    #   mhz/ghz/hz  -> clock speeds
+    #   w           -> wattage
+    #   k           -> 4K, etc. (also covered by 'p' for 720p/1080p)
+    for m in re.finditer(
+        r"(?<!\d)(\d{3,5})(?!\s?(?:p|gb|tb|mb|kb|mhz|ghz|hz|w)\b)",
+        text,
+        re.IGNORECASE,
+    ):
         val = float(m.group(1))
         if 150 <= val <= 25000:
             return None, val
@@ -157,26 +183,250 @@ OFF_TOPIC_REPLY = (
 )
 
 
+def _heuristic_use_case(user_text: str) -> str | None:
+    """Detect use case from raw text. Returns None if truly unclear.
+
+    Order matters: we check the most specific buckets first so a phrase like
+    "personal gaming PC" maps to gaming, not office. We use both whole-phrase
+    `substring` matches AND word-boundary regex matches so bare single-word
+    answers (e.g. just "personal", "office", "home") still get classified.
+    """
+    t = (user_text or "").lower().strip()
+    if not t:
+        return None
+
+    def has_word(*words: str) -> bool:
+        for w in words:
+            if re.search(rf"\b{re.escape(w)}\b", t):
+                return True
+        return False
+
+    if has_word("gaming", "esports", "valorant", "fortnite", "cs2") or any(
+        s in t for s in ("1440p", "1080p", "fps", "league of legends", "play games")
+    ):
+        return "gaming"
+    if has_word("workstation", "cad", "solidworks", "matlab") or any(
+        s in t for s in ("data science", "machine learning", "deep learning",
+                          "ml work", "engineering")
+    ):
+        return "workstation"
+    if has_word("davinci", "premiere", "blender", "render", "rendering",
+                "streaming", "twitch") or any(
+        s in t for s in ("video edit", "content creation", "youtube creator")
+    ):
+        return "content_creation"
+    if has_word("plex", "nas") or any(
+        s in t for s in ("home server", "media server", "file server")
+    ):
+        return "home_server"
+    # Office / general home use. Bare single words like "personal", "home",
+    # "office", "casual" should all classify here.
+    if has_word(
+        "office", "word", "excel", "zoom", "browse", "browsing",
+        "spreadsheet", "spreadsheets", "email", "emails", "documents",
+        "personal", "home", "general", "everyday", "casual", "basic",
+        "school", "study", "homework", "internet", "netflix", "youtube",
+        "web", "browser",
+    ) or any(s in t for s in ("social media", "day to day", "day-to-day")):
+        return "office"
+    return None
+
+
+def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
+    """Best-effort intent detection from raw text when the LLM fails.
+
+    Returns the same shape as the LLM's feedback JSON, or None if the text
+    is truly unclear.
+    """
+    if not user_text:
+        return None
+    t = user_text.lower().strip()
+
+    def has_word(*words: str) -> bool:
+        for w in words:
+            if re.search(rf"\b{re.escape(w)}\b", t):
+                return True
+        return False
+
+    # ---- Approval ----
+    approve_phrases = (
+        "looks good", "looks great", "perfect", "ship it",
+        "go with this", "go with that", "i'll take it", "ill take it",
+    )
+    if len(t) <= 60 and (
+        any(p in t for p in approve_phrases)
+        or has_word("approve", "approved", "yes", "thanks")
+    ):
+        return {"intent": "approve", "delta_constraints": {}, "target_categories": []}
+
+    # ---- Budget changes ----
+    lo, hi = _extract_budget_range(user_text)
+    budget_signals = (
+        "budget", "increase", "decrease", "raise", "lower", "bump",
+        "drop", "max", "maximum", "around", "spend", "between",
+    )
+    budget_signal_substrings = ("up to",)
+    if hi is not None and (
+        has_word(*budget_signals)
+        or any(s in t for s in budget_signal_substrings)
+        # A budget range like "$1000-$1500" or "between 800 and 1200"
+        # captured by _extract_budget_range (lo is set) implies budget intent.
+        or lo is not None
+    ):
+        deltas: Dict[str, Any] = {"budget_usd": hi}
+        if lo is not None:
+            deltas["budget_min_usd"] = lo
+        return {
+            "intent": "change_budget",
+            "delta_constraints": deltas,
+            "target_categories": [],
+        }
+
+    # "make it cheaper" / "more expensive" - relative budget
+    if has_word("cheaper") or any(s in t for s in ("less expensive", "lower price")):
+        return {
+            "intent": "swap_part",
+            "delta_constraints": {"price_lower": True},
+            "target_categories": [],
+        }
+
+    # ---- Component-specific tweaks ----
+    if has_word("quieter", "silent", "noiseless") or any(
+        s in t for s in ("less noisy", "less noise", "quiet")
+    ):
+        return {
+            "intent": "swap_part",
+            "delta_constraints": {"noise_preference": "quiet"},
+            "target_categories": ["cpu_cooler", "case"],
+        }
+    if any(s in t for s in ("more storage", "bigger ssd", "larger ssd",
+                              "more disk", "bigger drive")):
+        return {
+            "intent": "swap_part",
+            "delta_constraints": {"storage_capacity_gte": 2000},
+            "target_categories": ["storage"],
+        }
+    if any(s in t for s in ("more ram", "more memory", "bigger ram", "larger ram")):
+        return {
+            "intent": "swap_part",
+            "delta_constraints": {"memory_gte": 32},
+            "target_categories": ["memory"],
+        }
+    if any(s in t for s in ("nvidia", "geforce", "rtx", "gtx")) and any(
+        s in t for s in ("gpu", "graphics", "video", "card")
+    ):
+        return {
+            "intent": "swap_part",
+            "delta_constraints": {"chipset_contains": "nvidia"},
+            "target_categories": ["video_card"],
+        }
+    if any(s in t for s in ("amd gpu", "radeon")):
+        return {
+            "intent": "swap_part",
+            "delta_constraints": {"chipset_contains": "radeon"},
+            "target_categories": ["video_card"],
+        }
+
+    # ---- Generic "change X" requests ----
+    component_synonyms = {
+        "cpu": ("cpu", "processor"),
+        "video_card": ("gpu", "video card"),  # avoid bare "card"
+        "memory": ("ram", "memory"),
+        "storage": ("storage", "ssd", "hdd", "disk", "nvme"),
+        "motherboard": ("motherboard", "mobo"),
+        "power_supply": ("psu",),
+        "case": ("case", "chassis", "tower"),
+        "cpu_cooler": ("cooler", "fan"),
+    }
+    change_verbs = ("change", "swap", "replace", "different", "another", "new")
+    for cat, kws in component_synonyms.items():
+        if any(re.search(rf"\b{re.escape(kw)}\b", t) for kw in kws) and any(
+            re.search(rf"\b{re.escape(v)}\b", t) for v in change_verbs
+        ):
+            return {
+                "intent": "swap_part",
+                "delta_constraints": {},
+                "target_categories": [cat],
+            }
+
+    return None
+
+
 def _heuristic_requirements(user_text: str, base: Dict[str, Any]) -> Dict[str, Any]:
     """Fill gaps when the LLM is down and could not parse requirements."""
-    t = user_text.lower()
     if base.get("budget_usd") is None:
         lo, hi = _extract_budget_range(user_text)
         if hi is not None:
             base["budget_usd"] = hi
         if lo is not None and base.get("budget_min_usd") is None:
             base["budget_min_usd"] = lo
-    if base.get("use_case") == "general":
-        if any(w in t for w in ("gaming", "game", "1440p", "1080p", "fps")):
-            base["use_case"] = "gaming"
-        elif any(w in t for w in ("office", "word", "excel", "zoom", "browse")):
-            base["use_case"] = "office"
-        elif any(w in t for w in ("video edit", "davinci", "premiere", "render")):
-            base["use_case"] = "content_creation"
-    if base.get("budget_usd") and base.get("use_case") != "general":
+    if base.get("use_case") in (None, "general"):
+        uc = _heuristic_use_case(user_text)
+        if uc:
+            base["use_case"] = uc
+    if base.get("budget_usd") and base.get("use_case") not in (None, "general"):
         base["confidence"] = "high"
         base["clarifying_questions"] = []
     return base
+
+
+def _merge_requirements(prev: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge a freshly-extracted Requirements dict over the previous turn's.
+
+    Rules:
+    - Scalar fields: prefer the new value if non-empty/non-default; else keep
+      the previous value (so info already given in turn 1 isn't lost).
+    - List fields (must_have, nice_to_have, peripherals_needed): union.
+    - Confidence: recomputed at the end based on whether we now have both
+      budget_usd and a concrete use_case.
+    """
+    out: Dict[str, Any] = dict(prev or {})
+    new = new or {}
+
+    SCALAR_KEYS = (
+        "is_on_topic", "use_case", "budget_usd", "budget_min_usd",
+        "budget_flexible", "noise_preference", "form_factor_preference",
+        "os_needed",
+    )
+    for k in SCALAR_KEYS:
+        v = new.get(k)
+        if v is None:
+            continue
+        if k == "use_case" and v == "general" and out.get("use_case") not in (
+            None, "", "general"
+        ):
+            continue
+        if k == "form_factor_preference" and v == "any" and out.get(
+            "form_factor_preference"
+        ) not in (None, "", "any"):
+            continue
+        out[k] = v
+
+    for k in ("must_have", "nice_to_have", "peripherals_needed"):
+        merged = list(prev.get(k) or []) if prev else []
+        for item in new.get(k) or []:
+            if item not in merged:
+                merged.append(item)
+        out[k] = merged
+
+    # Recompute confidence after merge. If we now have budget + use_case,
+    # we're ready to plan - clear leftover clarifying questions.
+    have_budget = out.get("budget_usd") is not None
+    have_use_case = out.get("use_case") not in (None, "", "general")
+    if have_budget and have_use_case:
+        out["confidence"] = "high"
+        out["clarifying_questions"] = []
+    else:
+        # Inherit clarifying_questions from new extraction; fall back to prev.
+        out["clarifying_questions"] = (
+            new.get("clarifying_questions")
+            or (prev.get("clarifying_questions") if prev else [])
+            or []
+        )
+        out["confidence"] = new.get("confidence") or (
+            prev.get("confidence") if prev else "low"
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -206,13 +456,34 @@ def requirement_gatherer(state: AgentState) -> Dict[str, Any]:
     history = state.get("messages", [])
     msgs.extend(history)
 
+    # If a prior turn already extracted partial requirements (e.g. the user
+    # answered clarifying questions), give the LLM that context so it can
+    # MERGE rather than start from scratch and lose info.
+    prev_reqs = state.get("requirements") or {}
+    if prev_reqs:
+        msgs.append(HumanMessage(content=(
+            "Context from earlier in this conversation - the previously "
+            "extracted requirements snapshot. MERGE these with anything new "
+            "in my latest message above (do not lose information that was "
+            "given earlier):\n\n"
+            + json.dumps(prev_reqs, indent=2)
+        )))
+
     ai = invoke_with_retry(msgs, temperature=0.0)
     parsed = _parse_json_safely(ai.content) or {}
 
-    # LLM-flagged off-topic - return the standard refusal.
-    if parsed.get("is_on_topic") is False:
+    # LLM-flagged off-topic - but only trust it if our positive PC-signal
+    # regex ALSO agrees the text has no PC content. The LLM has been seen
+    # to misfire on inputs like "Personal PC with 512 GB storage" where
+    # "Personal" pattern-matches off-topic to the model. The heuristic is
+    # conservative and high-precision, so it wins ties.
+    if parsed.get("is_on_topic") is False and not _ON_TOPIC_HINTS.search(user_text):
         log.info("node.gather.off_topic_llm")
         return {"final_response": OFF_TOPIC_REPLY, "mode": "respond"}
+    if parsed.get("is_on_topic") is False and _ON_TOPIC_HINTS.search(user_text):
+        # Override the LLM - keep parsing requirements as if on-topic.
+        log.info("node.gather.off_topic_llm_override", reason="on_topic_hint_matched")
+        parsed["is_on_topic"] = True
 
     requirements = {
         "is_on_topic": parsed.get("is_on_topic", True),
@@ -229,16 +500,28 @@ def requirement_gatherer(state: AgentState) -> Dict[str, Any]:
         "confidence": parsed.get("confidence", "low"),
         "clarifying_questions": parsed.get("clarifying_questions", []) or [],
     }
-    # When the LLM is unavailable (or returned junk), parse budget/use-case from text.
-    if not parsed or "unable to reach the language model" in (ai.content or "").lower():
-        requirements = _heuristic_requirements(user_text, requirements)
-    else:
-        # Backfill budget from text if the LLM missed it / didn't see a range.
-        lo, hi = _extract_budget_range(user_text)
-        if requirements.get("budget_usd") is None and hi is not None:
-            requirements["budget_usd"] = hi
-        if requirements.get("budget_min_usd") is None and lo is not None:
-            requirements["budget_min_usd"] = lo
+
+    # Always run heuristic backfill on the latest message. This catches cases
+    # where the user supplied new info in a short follow-up ("office, $600-$700")
+    # that the LLM under-extracted from.
+    llm_unreachable = (
+        not parsed
+        or "unable to reach the language model" in (ai.content or "").lower()
+    )
+    requirements = _heuristic_requirements(user_text, requirements)
+
+    # Merge with previously-extracted requirements so info from turn 1
+    # ("512 GB storage, 8 GB RAM") isn't lost when turn 2 only provides
+    # the missing pieces ("office, $600-700").
+    if prev_reqs:
+        requirements = _merge_requirements(prev_reqs, requirements)
+
+    # Deterministic gating: we MUST have both budget and use_case before
+    # planning. Don't trust the LLM's `confidence` field alone - if it set
+    # confidence=high without enough info, override and ask anyway.
+    have_budget = requirements.get("budget_usd") is not None
+    have_use_case = requirements.get("use_case", "general") not in (None, "", "general")
+    needs_clarification = not (have_budget and have_use_case)
 
     log.info(
         "node.gather.done",
@@ -246,20 +529,38 @@ def requirement_gatherer(state: AgentState) -> Dict[str, Any]:
         budget=requirements["budget_usd"],
         budget_min=requirements.get("budget_min_usd"),
         use_case=requirements["use_case"],
+        merged=bool(prev_reqs),
+        llm_unreachable=llm_unreachable,
+        needs_clarification=needs_clarification,
         elapsed_ms=int((time.time() - t0) * 1000),
     )
 
-    # If confidence is low and we have clarifying questions, ask the user.
-    if requirements["confidence"] == "low" and requirements["clarifying_questions"]:
+    if needs_clarification:
+        # Use the LLM's clarifying questions if it gave any; otherwise
+        # synthesize the missing ones deterministically.
+        qs = list(requirements.get("clarifying_questions") or [])
+        if not qs:
+            if not have_use_case:
+                qs.append(
+                    "What is your primary use case "
+                    "(gaming, office, content creation, browsing, workstation)?"
+                )
+            if not have_budget:
+                qs.append("What is your total budget in USD (single number or a range)?")
+        requirements["clarifying_questions"] = qs
+        requirements["confidence"] = "low"
         q_text = "I need a little more info before I can suggest a build:\n\n"
-        q_text += "\n".join(f"- {q}" for q in requirements["clarifying_questions"][:3])
+        q_text += "\n".join(f"- {q}" for q in qs[:3])
         return {
             "requirements": requirements,
             "final_response": q_text,
             "mode": "respond",
         }
 
-    return {"requirements": requirements, "mode": "plan"}
+    # IMPORTANT: clear any stale `final_response` from a prior turn's
+    # short-circuit reply (e.g. clarifying questions). Otherwise the
+    # responder will short-circuit on it and never call the LLM.
+    return {"requirements": requirements, "final_response": None, "mode": "plan"}
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +976,9 @@ def _budget_fill_pass(build: Dict[str, Any], plan: Dict[str, Any],
     """Upgrade high-impact components if the build is well under budget.
 
     Aims for ~90% budget utilization. Upgrade priority depends on use case
-    (gaming -> GPU first; content creation -> CPU/memory first).
+    (gaming -> GPU first; content creation -> CPU/memory first). When the
+    user gave a range (budget_min_usd), the lower bound is a hard floor we
+    push above.
     """
     budget = float(reqs.get("budget_usd") or 0)
     if not budget:
@@ -684,8 +987,13 @@ def _budget_fill_pass(build: Dict[str, Any], plan: Dict[str, Any],
     def total_now() -> float:
         return round(sum(float(c.get("price", 0) or 0) for c in build.values() if c), 2)
 
-    target = budget * 0.90  # land near 90% of budget upper bound
-    floor = budget * 0.85   # but at least 85%
+    budget_min = reqs.get("budget_min_usd")
+    # Soft target = 90% of upper bound; hard floor = max(85% of upper, user's lower bound).
+    target = budget * 0.90
+    floor = budget * 0.85
+    if budget_min is not None:
+        floor = max(floor, float(budget_min))
+        target = max(target, float(budget_min))
 
     if total_now() >= floor:
         return build
@@ -883,15 +1191,43 @@ def _format_build_response(
     build: Dict[str, Any],
     issues: List[Dict[str, Any]],
     total: float,
+    intro: str | None = None,
+    note_kind: str = "unreachable",
 ) -> str:
-    """Markdown summary when Ollama is offline but parts were selected."""
-    lines = [
-        "Here is a build assembled from the parts catalog "
-        "(Ollama is offline, so this is a structured summary rather than an LLM-written reply).",
-        "",
-        "| Component | Part | Price |",
-        "|---|---|---|",
-    ]
+    """Markdown summary used when the LLM is unreachable / rate-limited but
+    the deterministic agent layer already picked all the parts.
+
+    `intro` lets the caller prepend any partial text the LLM did manage to
+    return (so we don't throw away the LLM's character summary).
+    `note_kind` controls the explanatory note at the top:
+       - "unreachable": the LLM call failed outright
+       - "truncated":   the LLM returned a tiny response (likely rate-limited)
+    """
+    settings = get_settings()
+    if note_kind == "truncated":
+        note = (
+            f"Note: `{settings.llm_provider}` is heavily rate-limited right "
+            f"now (most likely you've hit a daily token quota), so the model "
+            f"only returned a partial response. I've filled in the rest "
+            f"deterministically from the parts catalog. Wait ~60 seconds "
+            f"before sending the next message, or switch provider in `.env`."
+        )
+    else:
+        note = (
+            f"Note: `{settings.llm_provider}` was briefly unreachable, so "
+            f"this is a structured summary instead of the usual prose "
+            f"response. Send your next message in ~60 seconds and the full "
+            f"explanation should come back."
+        )
+
+    lines: List[str] = []
+    if intro:
+        lines.append(intro.strip())
+        lines.append("")
+    lines.append(note)
+    lines.append("")
+    lines.append("| Component | Part | Price |")
+    lines.append("|---|---|---|")
     for cat in CATEGORY_ORDER:
         comp = build.get(cat)
         if comp and isinstance(comp, dict):
@@ -901,7 +1237,47 @@ def _format_build_response(
             )
     lines.append("")
     budget = reqs.get("budget_usd")
-    lines.append(f"**Total: ${total:.2f}**" + (f" (your budget: ${budget})" if budget else ""))
+    budget_min = reqs.get("budget_min_usd")
+    if budget_min and budget:
+        budget_str = f" (your budget range: ${budget_min:.0f}-${budget:.0f})"
+    elif budget:
+        budget_str = f" (your budget: ${budget})"
+    else:
+        budget_str = ""
+    lines.append(f"**Total: ${total:.2f}**{budget_str}")
+
+    # Quick deterministic rationale highlighting the headline picks.
+    headline_picks = []
+    cpu = build.get("cpu") or {}
+    gpu = build.get("video_card") or {}
+    mem = build.get("memory") or {}
+    sto = build.get("storage") or {}
+    if cpu.get("name"):
+        headline_picks.append(
+            f"- **CPU** `{cpu['name']}` ({cpu.get('core_count', '?')} cores) - "
+            f"the strongest in-budget option for your use case."
+        )
+    if gpu.get("name") and gpu.get("price", 0) > 80:
+        headline_picks.append(
+            f"- **Video card** `{gpu['name']}` ({gpu.get('chipset') or '?'}) - "
+            f"selected for the performance/$ trade-off."
+        )
+    if mem.get("name"):
+        total_gb = mem.get("total_gb") or "?"
+        headline_picks.append(
+            f"- **Memory** `{mem['name']}` ({total_gb} GB total) - matches the "
+            f"motherboard's DDR generation."
+        )
+    if sto.get("name"):
+        cap = sto.get("capacity") or "?"
+        headline_picks.append(
+            f"- **Storage** `{sto['name']}` ({cap} GB) - fast SSD within budget."
+        )
+    if headline_picks:
+        lines.append("")
+        lines.append("**Why these picks:**")
+        lines.extend(headline_picks)
+
     missing = [c for c in CATEGORY_ORDER if not build.get(c)]
     if missing:
         lines.append("")
@@ -913,11 +1289,11 @@ def _format_build_response(
         lines.append("")
         lines.append("**Compatibility notes:**")
         lines.append(summarize_issues([Issue(**i) for i in issues]))
+
     lines.append("")
     lines.append(
-        "To get a full natural-language explanation, start Ollama and pull the model, "
-        "then send another message:\n"
-        "```\nollama serve\nollama pull qwen2.5:7b-instruct\n```"
+        "Want me to swap anything? Just say what you would like to change "
+        "(cheaper, quieter, smaller, more storage, etc.)."
     )
     return "\n".join(lines)
 
@@ -925,6 +1301,57 @@ def _format_build_response(
 # ---------------------------------------------------------------------------
 # 6. responder
 # ---------------------------------------------------------------------------
+
+def _normalize_response_markdown(text: str) -> str:
+    """Repair common GFM rendering pitfalls in the LLM's response.
+
+    The Streamlit / GFM markdown parser greedily extends a table until it
+    sees a blank line. LLMs often forget that rule and start writing prose
+    immediately after the last `|`-row, which then gets rendered as more
+    table rows. This normaliser:
+      1. Inserts a blank line after the LAST consecutive `|...|` line in
+         every table block.
+      2. Inserts a blank line before any `### ` heading that follows a
+         non-blank line.
+      3. Strips `*...*` wrappers around plain dollar amounts (e.g.
+         `*$697.70*`) which can render as LaTeX-ish italics.
+    """
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        is_table_row = line.lstrip().startswith("|")
+        # End of a table block? Next line exists, isn't blank, isn't a |-row.
+        next_line = lines[i + 1] if i + 1 < len(lines) else None
+        if (
+            is_table_row
+            and next_line is not None
+            and next_line.strip() != ""
+            and not next_line.lstrip().startswith("|")
+        ):
+            out.append("")  # force the table block to close
+        # Blank line before a heading if previous line had content.
+        if (
+            next_line is not None
+            and next_line.lstrip().startswith("### ")
+            and line.strip() != ""
+            and not is_table_row  # tables already handled above
+        ):
+            out.append("")
+        i += 1
+
+    cleaned = "\n".join(out)
+    if text.endswith("\n") and not cleaned.endswith("\n"):
+        cleaned += "\n"
+    # Strip *...* italics around plain dollar amounts.
+    cleaned = re.sub(r"\*\s*(\$\s*\d[\d,]*(?:\.\d+)?)\s*\*", r"\1", cleaned)
+    return cleaned
+
 
 def _build_comparison_markdown(
     prev: Dict[str, Any],
@@ -1047,14 +1474,38 @@ def responder(state: AgentState) -> Dict[str, Any]:
         HumanMessage(content="\n".join(human_parts)),
     ]
     ai = invoke_with_retry(msgs, temperature=0.3)
-    content = ai.content or ""
-    if "unable to reach the language model" in content.lower() and build:
-        content = _format_build_response(reqs, build, issues, total)
+    content = (ai.content or "").strip()
+
+    # Case 1: the LLM was completely unreachable - fall back to fully
+    # deterministic markdown using the picked parts.
+    if "unable to reach" in content.lower() and build:
+        content = _format_build_response(
+            reqs, build, issues, total, intro=None, note_kind="unreachable"
+        )
+
+    # Case 2: the LLM responded but the reply is suspiciously short and
+    # doesn't even contain the parts table. Most common cause is GitHub
+    # Models throttling output tokens when the daily quota is exhausted.
+    # Treat the short reply as an "intro" and append a deterministic
+    # build summary so the user still sees the full information.
+    elif build and len(content) < 400 and "|" not in content:
+        log.warning(
+            "node.respond.short_llm_output",
+            content_len=len(content),
+            content_preview=content[:160],
+        )
+        content = _format_build_response(
+            reqs, build, issues, total, intro=content, note_kind="truncated"
+        )
 
     # Safety net: if the LLM forgot the comparison section, append our
     # deterministic one.
     if comparison_md and "what changed" not in content.lower():
         content = content.rstrip() + "\n\n" + comparison_md
+
+    # Normalise markdown so the build table doesn't swallow subsequent
+    # paragraphs as extra rows (GFM rule: tables end at the first blank line).
+    content = _normalize_response_markdown(content)
 
     log.info(
         "node.respond.done",
@@ -1101,6 +1552,19 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
     ai = invoke_with_retry(msgs, temperature=0.1)
     fb = _parse_json_safely(ai.content) or {"intent": "unclear"}
 
+    # If the LLM bailed out as "unclear" (often because the small model
+    # produced non-JSON / truncated output), try to recover with a
+    # deterministic intent classifier on the raw text.
+    if fb.get("intent") in (None, "unclear"):
+        recovered = _heuristic_feedback(user_text)
+        if recovered:
+            log.info(
+                "node.feedback.heuristic_recovery",
+                original=fb.get("intent"),
+                recovered=recovered.get("intent"),
+            )
+            fb = recovered
+
     log.info(
         "node.feedback.parsed",
         intent=fb.get("intent"),
@@ -1116,17 +1580,27 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
             "mode": "respond",
         }
     if intent == "off_topic":
-        return {
-            "feedback": fb,
-            "final_response": OFF_TOPIC_REPLY,
-            "mode": "respond",
-        }
+        # Same safety net as the gatherer: only trust the LLM's off_topic
+        # classification if our positive PC-signal regex doesn't fire.
+        if not _ON_TOPIC_HINTS.search(user_text):
+            return {
+                "feedback": fb,
+                "final_response": OFF_TOPIC_REPLY,
+                "mode": "respond",
+            }
+        log.info("node.feedback.off_topic_llm_override", reason="on_topic_hint_matched")
+        # Fall through to deterministic handling - treat as a budget/swap
+        # request and let the rest of the function classify it.
+        fb["intent"] = "unclear"
+        intent = "unclear"
     if intent == "unclear":
         return {
             "feedback": fb,
-            "final_response": "I am not sure what you would like to change. "
-                              "Try something like: 'make it cheaper', 'more "
-                              "storage', 'quieter', or 'compare with a $900 budget'.",
+            "final_response": (
+                "I am not sure what you would like to change. Try something "
+                "like: 'increase budget to $700', 'make it cheaper', "
+                "'more storage', 'quieter', or 'compare with a $900 budget'."
+            ),
             "mode": "respond",
         }
 
@@ -1137,24 +1611,50 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
     # Apply deltas to requirements + plan, then re-plan from scratch.
     reqs = dict(state.get("requirements") or {})
     deltas = fb.get("delta_constraints") or {}
-    if "budget_usd" in deltas:
-        reqs["budget_usd"] = deltas["budget_usd"]
-    if "budget_min_usd" in deltas:
-        reqs["budget_min_usd"] = deltas["budget_min_usd"]
-    if "noise_preference" in deltas:
-        reqs["noise_preference"] = deltas["noise_preference"]
+
+    # Translate the relative "make it cheaper" signal into a concrete
+    # budget reduction (target ~80% of the current build's total, or 80%
+    # of the existing budget if no build exists yet).
+    if deltas.get("price_lower"):
+        current_total = sum(
+            float(c.get("price", 0) or 0)
+            for c in (state.get("build") or {}).values() if c
+        )
+        anchor = current_total or float(reqs.get("budget_usd") or 0) or 0
+        if anchor > 0:
+            reqs["budget_usd"] = round(anchor * 0.80, 2)
+            reqs.pop("budget_min_usd", None)
+            log.info("node.feedback.price_lower_anchor",
+                     anchor=anchor, new_budget=reqs["budget_usd"])
+        deltas.pop("price_lower", None)
+
+    # Structured deltas - apply directly to Requirements fields.
+    KNOWN_FIELD_DELTAS = {
+        "budget_usd", "budget_min_usd", "noise_preference", "use_case",
+        "form_factor_preference", "os_needed",
+    }
+    for k in KNOWN_FIELD_DELTAS:
+        if k in deltas and deltas[k] is not None:
+            reqs[k] = deltas[k]
     # Backfill range from raw text if the LLM missed it.
     lo, hi = _extract_budget_range(user_text)
     if hi is not None and "budget_usd" not in deltas:
         reqs["budget_usd"] = hi
     if lo is not None and "budget_min_usd" not in deltas:
         reqs["budget_min_usd"] = lo
+    # Backfill use_case from heuristic on the latest message if still vague.
+    if reqs.get("use_case", "general") in (None, "", "general"):
+        uc = _heuristic_use_case(user_text)
+        if uc:
+            reqs["use_case"] = uc
 
-    # Add explicit must-haves so the planner picks differently
+    # Any remaining delta keys (e.g. storage_capacity_gte, brand=AMD) are
+    # passed to the planner as explicit must-haves.
     extra = []
     for k, v in deltas.items():
-        if k not in ("budget_usd", "budget_min_usd", "noise_preference"):
-            extra.append(f"{k}={v}")
+        if k in KNOWN_FIELD_DELTAS or v is None:
+            continue
+        extra.append(f"{k}={v}")
     if extra:
         reqs["must_have"] = list(reqs.get("must_have") or []) + extra
 
