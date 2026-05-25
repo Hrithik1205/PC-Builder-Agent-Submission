@@ -51,6 +51,8 @@ def get_chat_model(temperature: float | None = None, **kwargs: Any):
     settings = get_settings()
     temp = temperature if temperature is not None else settings.llm_temperature
 
+    if settings.llm_provider == "github":
+        return _make_github(temp, settings.github_model, **kwargs)
     if settings.llm_provider == "cerebras":
         return _make_cerebras(temp, settings.cerebras_model, **kwargs)
     if settings.llm_provider == "huggingface":
@@ -71,6 +73,8 @@ def get_fallback_model(temperature: float | None = None, **kwargs: Any):
     settings = get_settings()
     temp = temperature if temperature is not None else settings.llm_temperature
 
+    if settings.llm_provider == "github":
+        return _make_github(temp, settings.github_fallback_model, **kwargs)
     if settings.llm_provider == "cerebras":
         return _make_cerebras(temp, settings.cerebras_fallback_model, **kwargs)
     if settings.llm_provider == "huggingface":
@@ -80,6 +84,45 @@ def get_fallback_model(temperature: float | None = None, **kwargs: Any):
     if settings.llm_provider == "ollama":
         return _make_ollama(temp, settings.ollama_fallback_model, **kwargs)
     return get_chat_model(temperature, **kwargs)
+
+
+def _make_github(temperature: float, model: str, **kwargs: Any):
+    """GitHub Models (Azure OpenAI-compatible API).
+
+    Free for personal use with a GitHub Personal Access Token.
+    PwC-compatible: endpoint passes through the corporate AI policy filter
+    because it's categorized as a Microsoft/GitHub service.
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError as e:
+        raise RuntimeError(
+            "github provider selected but `langchain-openai` is not installed. "
+            "Run: pip install langchain-openai"
+        ) from e
+    settings = get_settings()
+    if not settings.github_token:
+        raise RuntimeError(
+            "LLM_PROVIDER=github but GITHUB_TOKEN is not set.\n"
+            "Create a free Personal Access Token at https://github.com/settings/tokens\n"
+            "(classic token with the 'read:user' scope is enough) and add to .env:\n"
+            "  GITHUB_TOKEN=ghp_..."
+        )
+    log.debug(
+        "llm.github.create",
+        model=model,
+        temperature=temperature,
+        ssl_verify=settings.data_ssl_verify,
+    )
+    return ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        api_key=settings.github_token,
+        base_url=settings.github_models_base_url,
+        timeout=settings.llm_timeout_s,
+        **_httpx_clients_for_corp_proxy(),
+        **kwargs,
+    )
 
 
 def _make_cerebras(temperature: float, model: str, **kwargs: Any):

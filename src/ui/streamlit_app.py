@@ -36,6 +36,16 @@ def _llm_status():
     settings = get_settings()
     provider = settings.llm_provider
 
+    if provider == "github":
+        if not settings.github_token:
+            st.error(
+                "GitHub Models: no token — create a free PAT at "
+                "https://github.com/settings/tokens and add to `.env` as GITHUB_TOKEN"
+            )
+            return
+        st.success(f"GitHub Models: token set ({settings.github_model})")
+        return
+
     if provider == "cerebras":
         if not settings.cerebras_api_key:
             st.error(
@@ -141,6 +151,7 @@ def _render_sidebar():
         st.markdown("### PC Builder Agent")
         st.write(f"**Provider:** `{settings.llm_provider}`")
         _model_by_provider = {
+            "github": settings.github_model,
             "cerebras": settings.cerebras_model,
             "huggingface": settings.hf_model,
             "groq": settings.groq_model,

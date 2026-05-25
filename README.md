@@ -11,7 +11,7 @@ Built for the GenAI engineering take-home assignment. See `docs/agent_run_report
 - **LangGraph-based agent loop**: `requirement_gatherer -> planner (chain-of-thought) -> component_selector (tool-calling) -> compatibility_checker (deterministic rules) -> self_critique -> responder`, with a `feedback_handler` loop for follow-up turns.
 - **Deterministic compatibility engine** (pure Python, unit-tested) - the LLM is never trusted with hard constraints like socket matching, DDR generation, PSU sizing, or case form factor.
 - **Structured outputs everywhere** via Pydantic models (Requirements, Plan, Build, Issue, Critique, Feedback).
-- **Three runtime modes**, all free: **HuggingFace Inference** (default, corporate-friendly), **Groq** (fastest), or **Ollama** (offline, fully local). Provider is swapped via one line in `.env`.
+- **Multiple runtime modes**, all free: **GitHub Models** (default, corporate-friendly, Llama 3.3 70B), **Cerebras**, **HuggingFace**, **Groq**, or **Ollama** (offline, fully local). Provider is swapped via one line in `.env`.
 - **Bonus items shipped**: multi-node "multi-agent feel", SQLite-backed conversation memory across sessions, streaming responses, Streamlit chat UI, Dockerfile + docker-compose, 5-scenario evaluation harness.
 
 ## Architecture
@@ -115,11 +115,22 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Then choose **one** of three free paths:
+Then choose **one** of these free paths:
 
-#### Option A - HuggingFace Inference (default, corporate-friendly, free)
+#### Option A - GitHub Models (default, corporate-friendly, free)
 
-Best choice if other AI hosts are blocked by your corporate firewall - `huggingface.co` is on nearly every IT allow-list.
+Best choice if other AI hosts are blocked by your corporate firewall - the endpoint is hosted on `models.github.ai`, which passes through most corporate filters because it is categorized as a Microsoft / GitHub service. Verified working on PwC's network.
+
+1. Create a free Personal Access Token at [https://github.com/settings/tokens](https://github.com/settings/tokens) (classic token, no specific scopes needed).
+2. Visit [https://github.com/marketplace/models](https://github.com/marketplace/models) once and accept the terms if prompted (instant, no card).
+3. Open `.env` and paste your token:
+   ```
+   LLM_PROVIDER=github
+   GITHUB_TOKEN=ghp_...
+   ```
+   That's it - the LLM is now online. Default model is `meta/llama-3.3-70b-instruct` (open weights).
+
+#### Option B - HuggingFace Inference (alternative, free)
 
 1. Sign up at [https://huggingface.co/join](https://huggingface.co/join) (free, no credit card).
 2. Create a token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) with role **Read** (or higher).
@@ -128,9 +139,9 @@ Best choice if other AI hosts are blocked by your corporate firewall - `huggingf
    LLM_PROVIDER=huggingface
    HF_TOKEN=hf_...
    ```
-   That's it - the LLM is now online. Default model is `mistralai/Mistral-7B-Instruct-v0.3` (Apache 2.0).
+   Default model is `mistralai/Mistral-7B-Instruct-v0.3` (Apache 2.0).
 
-#### Option B - Groq (fastest, hosted, free)
+#### Option C - Groq (fastest, hosted, free)
 
 1. Sign up at [https://console.groq.com](https://console.groq.com) (free, no credit card).
 2. Create an API key at [https://console.groq.com/keys](https://console.groq.com/keys).
@@ -141,7 +152,7 @@ Best choice if other AI hosts are blocked by your corporate firewall - `huggingf
    ```
    Default model: `llama-3.3-70b-versatile` (open weights).
 
-#### Option C - Ollama (fully local, no API key)
+#### Option D - Ollama (fully local, no API key)
 
 1. Install Ollama: [https://ollama.com/download](https://ollama.com/download), then run `ollama serve`.
 2. Pull the model:

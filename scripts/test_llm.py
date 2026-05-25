@@ -21,7 +21,13 @@ from src.llm.providers import get_chat_model
 def main():
     s = get_settings()
     print(f"Provider: {s.llm_provider}")
-    if s.llm_provider == "groq":
+    if s.llm_provider == "github":
+        print(f"Model:    {s.github_model}")
+        print(f"Token set: {bool(s.github_token)}")
+    elif s.llm_provider == "cerebras":
+        print(f"Model:    {s.cerebras_model}")
+        print(f"Key set:  {bool(s.cerebras_api_key)}")
+    elif s.llm_provider == "groq":
         print(f"Model:    {s.groq_model}")
         print(f"Key set:  {bool(s.groq_api_key)}")
     elif s.llm_provider == "huggingface":

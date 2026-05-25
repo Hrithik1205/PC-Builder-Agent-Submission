@@ -28,19 +28,29 @@ class Settings(BaseSettings):
     )
 
     # ---------- LLM provider ----------
+    # "github"     = GitHub Models, free for personal use, PwC-compatible. Needs GITHUB_TOKEN.
     # "cerebras"   = hosted, free, very fast Llama 3.3 70B. Needs CEREBRAS_API_KEY.
     # "groq"       = hosted, free, Llama / Qwen. Needs GROQ_API_KEY.
     # "huggingface"= hosted, free, open-source models via HF Inference. Needs HF_TOKEN.
     # "ollama"     = fully local, no API key. Needs Ollama installed locally.
     # "openai" / "anthropic" = optional paid providers.
     llm_provider: Literal[
-        "cerebras", "groq", "huggingface", "ollama", "openai", "anthropic"
+        "github", "cerebras", "groq", "huggingface", "ollama", "openai", "anthropic"
     ] = Field(
-        default="cerebras",
-        description="Which LLM backend to use. Default is Cerebras (free, fast, PwC-compatible).",
+        default="github",
+        description="Which LLM backend to use. Default is GitHub Models (free, PwC-compatible).",
     )
 
-    # ---------- Cerebras (default - PwC-compatible, very fast Llama 3.3) ----------
+    # ---------- GitHub Models (default - PwC-compatible, free for personal use) ----------
+    # https://github.com/marketplace/models  |  PAT: https://github.com/settings/tokens
+    # Uses an OpenAI-compatible API hosted on Azure.
+    github_token: Optional[str] = None
+    github_models_base_url: str = "https://models.github.ai/inference"
+    # Llama 3.3 70B Instruct (open weights). Fallback: smaller / faster Llama 3.1 8B.
+    github_model: str = "meta/llama-3.3-70b-instruct"
+    github_fallback_model: str = "meta/meta-llama-3.1-8b-instruct"
+
+    # ---------- Cerebras (alternative - PwC-compatible, very fast) ----------
     cerebras_api_key: Optional[str] = None
     cerebras_base_url: str = "https://api.cerebras.ai/v1"
     cerebras_model: str = "llama-3.3-70b"
