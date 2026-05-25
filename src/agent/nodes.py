@@ -469,22 +469,46 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
             "delta_constraints": {"memory_gte": 32},
             "target_categories": ["memory"],
         }
-    if any(s in t for s in ("nvidia", "geforce", "rtx", "gtx")) and any(
-        s in t for s in ("gpu", "graphics", "video", "card")
-    ):
+    # ---- GPU brand swaps ----
+    # Triggers (any of):
+    #  - "nvidia"/"geforce"/"rtx"/"gtx" + (gpu keyword OR swap context)
+    #  - "radeon" anywhere (it's specifically a GPU brand, never a CPU)
+    #  - bare "amd" near a gpu keyword OR in a swap context that ALSO mentions
+    #    a gpu keyword - so "swap GPU with AMD" classifies as GPU, not CPU.
+    has_nvidia = re.search(r"\b(nvidia|geforce|rtx|gtx)\b", t) is not None
+    has_radeon = "radeon" in t
+    has_amd_word = re.search(r"\bamd\b", t) is not None
+    has_gpu_kw = any(s in t for s in ("gpu", "graphics", "video card", " card"))
+    swap_context = any(
+        s in t for s in ("swap", "change", "switch", "replace", "use ", "go with", "instead")
+    )
+
+    if has_nvidia and (has_gpu_kw or swap_context):
         return {
             "intent": "swap_part",
             "delta_constraints": {
-                "chipset_contains": "nvidia",
+                "chipset_contains": "GeForce",
                 "gpu_brand_preference": "nvidia",
             },
             "target_categories": ["video_card"],
         }
-    if any(s in t for s in ("amd gpu", "radeon")):
+    if has_radeon:
         return {
             "intent": "swap_part",
             "delta_constraints": {
-                "chipset_contains": "radeon",
+                "chipset_contains": "Radeon",
+                "gpu_brand_preference": "amd",
+            },
+            "target_categories": ["video_card"],
+        }
+    # Bare "AMD" + gpu keyword => GPU swap (NOT a CPU swap). This MUST come
+    # before the CPU brand block below or "swap GPU with AMD" would be
+    # misclassified as a CPU brand change.
+    if has_amd_word and has_gpu_kw:
+        return {
+            "intent": "swap_part",
+            "delta_constraints": {
+                "chipset_contains": "Radeon",
                 "gpu_brand_preference": "amd",
             },
             "target_categories": ["video_card"],
@@ -1072,7 +1096,14 @@ def _pick_video_card(plan, reqs, build) -> Dict[str, Any] | None:
         return None
     budget = plan["budget_allocation"]["video_card"] * 1.15
     budget = _category_price_ceiling(reqs, "video_card", budget)
-    filters: Dict[str, Any] = {"price_lte": budget, "price_gte": 80}
+    # Filter out ancient / extremely-low-end cards. A 2011 GTX 570 has 1.28 GB
+    # VRAM and high TDP; we never want it in a modern build. Modern entry-
+    # level discrete GPUs have >= 4 GB VRAM.
+    filters: Dict[str, Any] = {
+        "price_lte": budget,
+        "price_gte": 80,
+        "memory_gte": 4,
+    }
     # Honor an explicit GPU brand preference (chipset column carries the
     # marketing name, e.g. "GeForce RTX 4070" or "Radeon RX 7800 XT").
     gbrand = (reqs.get("gpu_brand_preference") or "").lower()
@@ -1080,13 +1111,31 @@ def _pick_video_card(plan, reqs, build) -> Dict[str, Any] | None:
         filters["chipset_contains"] = "GeForce"
     elif gbrand == "amd":
         filters["chipset_contains"] = "Radeon"
-    results = search_components_impl("video_card", filters=filters,
-                                     sort_by="estimated_tdp", ascending=False, top_k=10)
+
+    # Sort by price DESC - within budget, the most expensive card is almost
+    # always the newest/most performant generation. Using estimated_tdp DESC
+    # (the previous strategy) accidentally favored ancient inefficient cards
+    # like the GTX 570 (219W) over modern efficient ones (RTX 4060 at 115W).
+    results = search_components_impl(
+        "video_card", filters=filters,
+        sort_by="price", ascending=False, top_k=10,
+    )
+    if not results:
+        # Relax the VRAM floor first (very tight budgets).
+        filters.pop("memory_gte", None)
+        results = search_components_impl(
+            "video_card", filters=filters,
+            sort_by="price", ascending=False, top_k=10,
+        )
     if not results and gbrand:
+        # Drop brand filter as a last resort - better a wrong-brand modern
+        # card than no card.
         filters.pop("chipset_contains", None)
         log.info("node.select.brand_relaxed", brand=gbrand, category="video_card")
-        results = search_components_impl("video_card", filters=filters,
-                                         sort_by="estimated_tdp", ascending=False, top_k=10)
+        results = search_components_impl(
+            "video_card", filters=filters,
+            sort_by="price", ascending=False, top_k=10,
+        )
     if not results:
         return None
     return results[0]
@@ -1257,13 +1306,33 @@ def _pick_relaxed(
         # picker returned None.
         if not _need_discrete_gpu(reqs):
             return None
+        gbrand = (reqs.get("gpu_brand_preference") or "").lower()
+        filters: Dict[str, Any] = {
+            "price_lte": headroom,
+            "price_gte": 50,
+            "memory_gte": 4,  # exclude ancient sub-4GB cards
+        }
+        if gbrand == "nvidia":
+            filters["chipset_contains"] = "GeForce"
+        elif gbrand == "amd":
+            filters["chipset_contains"] = "Radeon"
         results = search_components_impl(
-            "video_card",
-            filters={"price_lte": headroom, "price_gte": 50},
-            sort_by="price",
-            ascending=False,
-            top_k=10,
+            "video_card", filters=filters,
+            sort_by="price", ascending=False, top_k=10,
         )
+        if not results:
+            filters.pop("memory_gte", None)
+            results = search_components_impl(
+                "video_card", filters=filters,
+                sort_by="price", ascending=False, top_k=10,
+            )
+        if not results and gbrand:
+            filters.pop("chipset_contains", None)
+            log.info("node.select.brand_relaxed", brand=gbrand, category="video_card")
+            results = search_components_impl(
+                "video_card", filters=filters,
+                sort_by="price", ascending=False, top_k=10,
+            )
         return results[0] if results else None
 
     if cat == "case":
@@ -1306,10 +1375,23 @@ def _try_upgrade(category: str, current: Dict[str, Any], ceiling: float,
         return None
 
     if category == "video_card":
+        gbrand = (reqs.get("gpu_brand_preference") or "").lower()
+        filters: Dict[str, Any] = {
+            "price_lte": ceiling,
+            "price_gte": cur_price * 1.15,
+            "memory_gte": 4,
+        }
+        if gbrand == "nvidia":
+            filters["chipset_contains"] = "GeForce"
+        elif gbrand == "amd":
+            filters["chipset_contains"] = "Radeon"
+        # Price DESC - the priciest in-budget card is usually the best
+        # (modern, more VRAM, more cores) - far more reliable than TDP DESC
+        # which would favor ancient inefficient cards.
         results = search_components_impl(
             "video_card",
-            filters={"price_lte": ceiling, "price_gte": cur_price * 1.15},
-            sort_by="estimated_tdp", ascending=False,
+            filters=filters,
+            sort_by="price", ascending=False,
             top_k=5,
         )
         return results[0] if results else None
@@ -1576,11 +1658,30 @@ def _try_downgrade(category: str, current: Dict[str, Any], max_price: float,
         # - signal that with None and let the caller delete it.
         if not _need_discrete_gpu(reqs):
             return None  # caller handles removal
+        gbrand = (reqs.get("gpu_brand_preference") or "").lower()
+        filters: Dict[str, Any] = {
+            "price_lte": max_price,
+            "price_gte": 50,
+            "memory_gte": 4,
+        }
+        if gbrand == "nvidia":
+            filters["chipset_contains"] = "GeForce"
+        elif gbrand == "amd":
+            filters["chipset_contains"] = "Radeon"
+        # Price DESC - even when trimming we want the most modern card we
+        # can still afford.
         results = search_components_impl(
             "video_card",
-            filters={"price_lte": max_price, "price_gte": 50},
-            sort_by="estimated_tdp", ascending=False, top_k=5,
+            filters=filters,
+            sort_by="price", ascending=False, top_k=5,
         )
+        if not results:
+            filters.pop("memory_gte", None)
+            results = search_components_impl(
+                "video_card",
+                filters=filters,
+                sort_by="price", ascending=False, top_k=5,
+            )
         return results[0] if results else None
 
     # Generic: pick the most expensive thing that still fits the new ceiling
