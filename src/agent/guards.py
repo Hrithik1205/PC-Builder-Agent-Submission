@@ -7,14 +7,24 @@ from typing import Dict, Iterable, Optional, Tuple
 from src.data.loader import get_catalog
 
 
-# Strings strongly indicative of jailbreak attempts. Match conservatively.
+# Strings strongly indicative of jailbreak / prompt-extraction attempts.
+# Match conservatively - false positives are worse than letting an obvious
+# attempt through (we always have the LLM-side TOPIC GATE as second line).
 _INJECTION_PATTERNS = [
-    r"\bignore (all|previous|prior|above) (instructions?|prompts?)\b",
+    r"\bignore (all|any|every|previous|prior|above) (instructions?|prompts?|rules?)\b",
+    r"\bforget (everything|all|previous|prior|your) (instructions?|prompts?|rules?|context)?\b",
     r"\byou are now\b",
-    r"\bdisregard (the|all|previous) (instructions?|rules?)\b",
+    r"\bdisregard (the|all|previous|any) (instructions?|rules?)\b",
     r"\bact as (a|an) [a-z]+\b",
+    r"\bpretend (to be|you are)\b",
+    r"\b(roleplay|role-play) as\b",
     r"\bdeveloper mode\b",
+    r"\bjailbreak\b",
     r"\bsystem prompt\b",
+    r"\bshow (me )?your (prompt|instructions?|rules?|guidelines?)\b",
+    r"\b(what|which) (are|is) your (prompt|instructions?|rules?|guidelines?)\b",
+    r"\breveal your (prompt|instructions?|system message)\b",
+    r"\bprint your (system )?(prompt|instructions?)\b",
 ]
 
 

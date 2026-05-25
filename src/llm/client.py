@@ -4,8 +4,8 @@
 hitting the provider directly. It:
   * approximates token usage and trims older messages if over budget,
   * retries transient errors with exponential backoff (tenacity),
-  * falls back to the smaller `OLLAMA_FALLBACK_MODEL` if the primary
-    times out repeatedly,
+  * falls back to the smaller configured fallback model if the primary
+    times out / rate-limits repeatedly,
   * returns a deterministic stub response if all retries fail, so the
     graph never crashes.
 """
@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from tenacity import (
     RetryError,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -36,9 +36,28 @@ log = get_logger(__name__)
 # reasonable approximation and only used for budget guards.
 _ENCODER = tiktoken.get_encoding("cl100k_base")
 
-# Errors we treat as retryable. Plain Exception subclasses; we deliberately
-# don't import Ollama-specific exceptions to keep this provider-agnostic.
+# Errors we treat as retryable (classic network errors).
 RETRYABLE_EXCEPTIONS = (TimeoutError, ConnectionError, OSError)
+
+
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    """Classify openai / httpx / langchain exceptions that warrant a retry.
+
+    GitHub Models (langchain-openai), Cerebras, and Groq all surface
+    rate-limit / transient server errors as openai.RateLimitError or
+    APIStatusError. We classify by inspecting the exception name and
+    optional `.status_code` attribute, which avoids hard-importing optional
+    SDKs."""
+    if isinstance(exc, RETRYABLE_EXCEPTIONS):
+        return True
+    name = type(exc).__name__.lower()
+    if any(k in name for k in ("ratelimit", "timeout", "apiconnection",
+                                  "internalserver", "serviceunavailable")):
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    if isinstance(status, int) and status in (408, 409, 429, 500, 502, 503, 504):
+        return True
+    return False
 
 
 def estimate_tokens(text: str) -> int:
@@ -89,8 +108,8 @@ def invoke_with_retry(
 
     @retry(
         stop=stop_after_attempt(settings.llm_max_retries),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+        wait=wait_exponential(multiplier=1, min=2, max=20),
+        retry=retry_if_exception(_is_retryable_http_error),
         reraise=True,
     )
     def _call(model):
@@ -122,24 +141,96 @@ def invoke_with_retry(
     try:
         primary = get_chat_model(temperature=temperature)
         return _call(primary)
-    except (RetryError, *RETRYABLE_EXCEPTIONS) as e:
-        log.warning("llm.primary_failed", error=str(e)[:200])
+    except Exception as e:
+        # Log full exception details so root-cause is easy to see in traces.
+        log.warning(
+            "llm.primary_failed",
+            error_type=type(e).__name__,
+            status_code=getattr(e, "status_code", None)
+                        or getattr(e, "http_status", None),
+            error=str(e)[:300],
+        )
         try:
             fallback = get_fallback_model(temperature=temperature)
             return _call(fallback)
         except Exception as e2:
-            log.error("llm.fallback_failed", error=str(e2)[:200])
-            return _fallback_stub()
-    except Exception as e:
-        # Non-retryable error from the LLM (e.g. invalid arguments) - log and stub.
-        log.error("llm.unexpected_error", error=str(e)[:200])
-        return _fallback_stub()
+            log.error(
+                "llm.fallback_failed",
+                error_type=type(e2).__name__,
+                status_code=getattr(e2, "status_code", None)
+                            or getattr(e2, "http_status", None),
+                error=str(e2)[:300],
+            )
+            return _fallback_stub(last_error=e2 or e)
 
 
-def _fallback_stub() -> AIMessage:
-    """Deterministic stub used when the LLM is fully unavailable."""
-    return AIMessage(content=(
-        "I'm currently unable to reach the language model. Please make sure "
-        "Ollama is running (`ollama serve`) and the configured model is pulled "
-        "(`ollama pull qwen2.5:7b-instruct`), then try again."
-    ))
+def _fallback_stub(last_error: Optional[BaseException] = None) -> AIMessage:
+    """Deterministic stub used when the LLM is fully unavailable.
+
+    The message is provider-aware so users running on GitHub Models /
+    Cerebras / Groq don't get told to "start Ollama".
+    """
+    settings = get_settings()
+    provider = settings.llm_provider
+    err_kind = type(last_error).__name__ if last_error else ""
+    status = (
+        getattr(last_error, "status_code", None)
+        or getattr(last_error, "http_status", None)
+        if last_error else None
+    )
+
+    hint = ""
+    if status == 429 or "ratelimit" in err_kind.lower():
+        hint = (
+            " You've hit the provider's rate limit. Wait ~60 seconds and "
+            "send the message again."
+        )
+    elif status in (401, 403):
+        hint = (
+            " Your API key was rejected. Open `.env`, refresh the token, "
+            "and restart the app."
+        )
+    elif status in (500, 502, 503, 504):
+        hint = " The provider's API is having issues. Try again in a minute."
+
+    provider_specifics = {
+        "github": (
+            "I'm currently unable to reach GitHub Models."
+            + hint
+            + " Check https://github.com/marketplace/models for status, or "
+            "switch to a different provider in `.env`."
+        ),
+        "cerebras": (
+            "I'm currently unable to reach Cerebras."
+            + hint
+            + " Verify CEREBRAS_API_KEY in `.env`."
+        ),
+        "groq": (
+            "I'm currently unable to reach Groq."
+            + hint
+            + " Verify GROQ_API_KEY in `.env`."
+        ),
+        "huggingface": (
+            "I'm currently unable to reach the HuggingFace Inference API."
+            + hint
+            + " Verify HF_TOKEN in `.env` and that the model is loaded."
+        ),
+        "ollama": (
+            "I'm currently unable to reach the language model. Please make "
+            "sure Ollama is running (`ollama serve`) and the configured "
+            "model is pulled (`ollama pull " + settings.ollama_model + "`)."
+        ),
+        "openai": (
+            "I'm currently unable to reach OpenAI." + hint
+            + " Verify OPENAI_API_KEY in `.env`."
+        ),
+        "anthropic": (
+            "I'm currently unable to reach Anthropic." + hint
+            + " Verify ANTHROPIC_API_KEY in `.env`."
+        ),
+    }
+    msg = provider_specifics.get(
+        provider,
+        "I'm currently unable to reach the language model." + hint,
+    )
+    return AIMessage(content=msg)

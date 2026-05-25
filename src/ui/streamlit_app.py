@@ -302,8 +302,8 @@ def main():
 
     st.title("PC Builder Agent")
     st.caption(
-        "Open-source agentic AI that picks compatible PC parts from a fixed "
-        "catalog. Type your requirements below."
+        "An agentic AI that picks compatible PC parts from a fixed catalog. "
+        "Type your requirements below."
     )
 
     for role, content in st.session_state.history:
@@ -319,7 +319,7 @@ def main():
         st.session_state.processing = True
         st.session_state.history.append(("user", prompt))
         try:
-            with st.spinner("Building your PC (first run may take 1-2 min to load data)..."):
+            with st.spinner("Thinking (it may take 1-2 mins)..."):
                 reply = _run_agent(prompt)
             st.session_state.history.append(("assistant", reply))
         except Exception as e:

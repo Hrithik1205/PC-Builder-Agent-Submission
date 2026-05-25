@@ -97,13 +97,66 @@ def _few_shot_messages(fewshots: List[Dict[str, Any]]):
 def _extract_budget_range(user_text: str) -> tuple[float | None, float | None]:
     """Parse `(min, max)` budget. Returns `(None, max)` if only a single value.
 
-    Avoids confusing display resolutions (1440p, 1080p, 4K) with dollars.
+    Handles common phrasings:
+      - "$1500" / "1500$" / "1,500" / "$1,500"
+      - "1500 dollars" / "1500 USD"
+      - "$1.5k" / "2k budget" / "$2K"
+      - "$1000-$1500" / "between $1000 and $1500" / "1000 to 1500"
+
+    Suppresses false positives:
+      - Display resolutions (1440p, 1080p, 4K)
+      - GPU model numbers (RTX 4090, GTX 1660, RX 7800, Arc B580)
+      - Storage / RAM / wattage / clock numbers (256 GB, 16 GB, 750 W, 6 GHz)
     """
+    if not user_text:
+        return None, None
     text = user_text.replace(",", "")
+
+    # ---- "1.5k" / "2k" notation ----
+    # Replace e.g. "$1.5k" -> "$1500", "2k" -> "2000". To avoid colliding
+    # with display resolutions like "4K", "8K", we only expand when there's
+    # a budget signal nearby (a $ sign or a budget-related word within ~30
+    # chars on either side of the match).
+    BUDGET_K_CONTEXT = re.compile(
+        r"\$|\b(budget|spend|spending|cost|price|under|max|for|around|about|"
+        r"have|up to|up-to|range)\b",
+        re.IGNORECASE,
+    )
+
+    def _expand_k(m: "re.Match[str]") -> str:
+        full_text = m.string
+        start, end = m.start(), m.end()
+        window_start = max(0, start - 30)
+        window_end = min(len(full_text), end + 30)
+        window = full_text[window_start:window_end]
+        if not BUDGET_K_CONTEXT.search(window):
+            return m.group(0)  # leave it alone (likely "4K", "8K" resolution)
+        num = float(m.group(1))
+        return f"{int(round(num * 1000))}"
+
+    text = re.sub(r"\$?\s*(\d+(?:\.\d+)?)\s*[kK]\b", _expand_k, text)
+
+    # Mask GPU model numbers so they cannot be mistaken for budgets.
+    # We replace the digit run with spaces of equal length so other regex
+    # offsets aren't disturbed.
+    def _mask(pattern: str, s: str) -> str:
+        return re.sub(
+            pattern,
+            lambda m: m.group(0)[: m.start(1) - m.start()] + " " * (m.end(1) - m.start(1)) + m.group(0)[m.end(1) - m.start():],
+            s,
+            flags=re.IGNORECASE,
+        )
+
+    # GPU families: RTX/GTX/RX/Arc XXXX(XX)
+    text = _mask(r"\b(?:rtx|gtx|rx|arc|titan)\s*(\d{3,5})\b", text)
+    # CPU model numbers like "i5-14600K", "Ryzen 7 7700X"
+    text = _mask(r"\b(?:i[3579]|core\s*i[3579]|ryzen\s*\d?|core\s*ultra)\s*[- ]?\s*(\d{4,5})", text)
+
     # Patterns that capture an explicit range.
     range_patterns = [
+        r"between\s*\$?\s*(\d{2,5})\s*(?:and|to|-)\s*\$?\s*(\d{2,5})",
+        r"from\s*\$?\s*(\d{2,5})\s*(?:to|-)\s*\$?\s*(\d{2,5})",
         r"\$?\s*(\d{2,5})\s*(?:-|to|and)\s*\$?\s*(\d{2,5})",
-        r"between\s*\$?\s*(\d{2,5})\s*(?:and|to)\s*\$?\s*(\d{2,5})",
     ]
     for pat in range_patterns:
         m = re.search(pat, text, re.IGNORECASE)
@@ -115,8 +168,9 @@ def _extract_budget_range(user_text: str) -> tuple[float | None, float | None]:
                 return lo, hi
     # Single-value patterns (preferred over loose digit matches).
     single_patterns = [
-        r"\$\s*(\d{2,5})\b",
-        r"(?:for|budget)\s*\$?\s*(\d{2,5})\b",
+        r"\$\s*(\d{2,5})\b",                          # $1500
+        r"(\d{2,5})\s*\$",                            # 1500$
+        r"(?:for|budget|around|about)\s*\$?\s*(\d{2,5})\b",
         r"(\d{2,5})\s*(?:usd|dollars?)\b",
     ]
     for pat in single_patterns:
@@ -201,18 +255,38 @@ def _heuristic_use_case(user_text: str) -> str | None:
                 return True
         return False
 
-    if has_word("gaming", "esports", "valorant", "fortnite", "cs2") or any(
-        s in t for s in ("1440p", "1080p", "fps", "league of legends", "play games")
+    if has_word(
+        "gaming", "game", "games", "gamer", "esports", "valorant", "fortnite",
+        "cs2", "warzone", "minecraft", "roblox",
+    ) or any(
+        s in t for s in (
+            "1440p", "1080p", "fps", "league of legends", "play games",
+            "game on", "for games", "for game",
+        )
     ):
         return "gaming"
-    if has_word("workstation", "cad", "solidworks", "matlab") or any(
-        s in t for s in ("data science", "machine learning", "deep learning",
-                          "ml work", "engineering")
+    # Workstation: heavy compute (ML, scientific, CAD, engineering, 3D render).
+    if has_word(
+        "workstation", "cad", "solidworks", "matlab", "autocad", "revit",
+        "fea", "simulation",
+    ) or any(
+        s in t for s in (
+            "data science", "machine learning", "deep learning",
+            "ml work", "ml training", "model training", "engineering",
+            "3d render", "scientific computing", "neural network",
+            "ai training", "llm training",
+        )
     ):
         return "workstation"
-    if has_word("davinci", "premiere", "blender", "render", "rendering",
-                "streaming", "twitch") or any(
-        s in t for s in ("video edit", "content creation", "youtube creator")
+    if has_word(
+        "davinci", "premiere", "blender", "render", "rendering",
+        "streaming", "twitch", "lightroom",
+    ) or any(
+        s in t for s in (
+            "video edit", "content creation", "youtube creator", "youtuber",
+            "photo edit", "image edit", "podcast", "music production",
+            "audio production",
+        )
     ):
         return "content_creation"
     if has_word("plex", "nas") or any(
@@ -222,12 +296,15 @@ def _heuristic_use_case(user_text: str) -> str | None:
     # Office / general home use. Bare single words like "personal", "home",
     # "office", "casual" should all classify here.
     if has_word(
-        "office", "word", "excel", "zoom", "browse", "browsing",
-        "spreadsheet", "spreadsheets", "email", "emails", "documents",
-        "personal", "home", "general", "everyday", "casual", "basic",
-        "school", "study", "homework", "internet", "netflix", "youtube",
-        "web", "browser",
-    ) or any(s in t for s in ("social media", "day to day", "day-to-day")):
+        "office", "work", "working", "word", "excel", "zoom", "browse",
+        "browsing", "spreadsheet", "spreadsheets", "email", "emails",
+        "documents", "personal", "home", "general", "everyday", "casual",
+        "basic", "school", "study", "homework", "internet", "netflix",
+        "youtube", "web", "browser", "teams",
+    ) or any(s in t for s in (
+        "social media", "day to day", "day-to-day", "wfh", "work from home",
+        "remote work",
+    )):
         return "office"
     return None
 
@@ -259,8 +336,53 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
     ):
         return {"intent": "approve", "delta_constraints": {}, "target_categories": []}
 
-    # ---- Budget changes ----
+    # ---- Comparison requests (must come BEFORE change_budget so phrases
+    # like "compare with $900 budget" are not eaten by the budget branch).
     lo, hi = _extract_budget_range(user_text)
+    compare_signals = (
+        "compare", "comparison", "vs.", " vs ", "versus",
+        "side by side", "side-by-side",
+    )
+    hypothetical_signals = (
+        "what if i had", "what if i spent", "what would i get",
+        "what could i get", "if i had", "if i spent",
+        "if my budget were", "if my budget was",
+        "show me a build for",
+    )
+    if any(s in t for s in compare_signals) or any(
+        s in t for s in hypothetical_signals
+    ):
+        deltas: Dict[str, Any] = {}
+        if hi is not None:
+            deltas["budget_usd"] = hi
+        if lo is not None:
+            deltas["budget_min_usd"] = lo
+        return {
+            "intent": "compare_builds",
+            "delta_constraints": deltas,
+            "target_categories": [],
+        }
+
+    # ---- Relative budget moves (no explicit dollar amount needed) ----
+    # "double my budget", "halve it", "cut my budget in half", "1.5x budget".
+    rel_budget_factor: float | None = None
+    if re.search(r"\bdouble (the|my)? ?budget\b", t) or re.search(r"\b2x (the |my )?budget\b", t):
+        rel_budget_factor = 2.0
+    elif re.search(r"\btriple (the|my)? ?budget\b", t):
+        rel_budget_factor = 3.0
+    elif re.search(r"\b(half|halve)\b.*\bbudget\b", t) or re.search(r"\bcut.*budget.*half\b", t):
+        rel_budget_factor = 0.5
+    elif re.search(r"\b1\.5x (the |my )?budget\b", t):
+        rel_budget_factor = 1.5
+    if rel_budget_factor is not None:
+        # Caller computes the actual new budget from current state.
+        return {
+            "intent": "change_budget",
+            "delta_constraints": {"budget_multiplier": rel_budget_factor},
+            "target_categories": [],
+        }
+
+    # ---- Budget changes ----
     budget_signals = (
         "budget", "increase", "decrease", "raise", "lower", "bump",
         "drop", "max", "maximum", "around", "spend", "between",
@@ -273,7 +395,7 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
         # captured by _extract_budget_range (lo is set) implies budget intent.
         or lo is not None
     ):
-        deltas: Dict[str, Any] = {"budget_usd": hi}
+        deltas = {"budget_usd": hi}
         if lo is not None:
             deltas["budget_min_usd"] = lo
         return {
@@ -787,46 +909,75 @@ def _category_price_ceiling(reqs: Dict[str, Any], category: str,
     return default_budget
 
 
+# Mainstream sockets, in order of motherboard availability / common-ness.
+# When no explicit platform is set we restrict the CPU picker to this list
+# so we never end up with an LGA1851/sTRX4 CPU paired with a board that
+# doesn't exist or doesn't fit the budget.
+_MAINSTREAM_SOCKETS = ["AM5", "AM4", "LGA1700", "LGA1200"]
+
+
 def _pick_cpu(plan: Dict[str, Any], reqs: Dict[str, Any], build: Dict[str, Any]) -> Dict[str, Any] | None:
     budget = plan["budget_allocation"]["cpu"] * 1.15  # 15% per-category slack
     budget = _category_price_ceiling(reqs, "cpu", budget)
     platform = (plan.get("platform_preference") or "any").upper()
     need_igpu = not _need_discrete_gpu(reqs)
-    filters: Dict[str, Any] = {"price_lte": budget, "price_gte": 50}
-    if platform != "ANY":
-        filters["socket"] = platform
+    base_filters: Dict[str, Any] = {"price_lte": budget, "price_gte": 50}
     if need_igpu:
-        filters["has_integrated_graphics"] = True
+        base_filters["has_integrated_graphics"] = True
     # Honor an explicit CPU brand preference (e.g. "I want AMD, not Intel").
     # The CSV's `name` column starts with the brand ("AMD Ryzen ..." /
     # "Intel Core ..."), so a substring match on it is a reliable filter.
     brand = (reqs.get("cpu_brand_preference") or "").lower()
     if brand in ("amd", "intel"):
-        filters["name_contains"] = brand.upper() if brand == "amd" else "Intel"
-        # AMD CPUs live on AM4/AM5; Intel on LGA. If the planner fixed a
-        # platform_preference that conflicts with the brand (e.g. AM5 + Intel),
-        # drop the socket filter so the picker can find a real candidate.
-        if "socket" in filters:
-            soc = str(filters["socket"]).upper()
-            if (brand == "amd" and soc.startswith("LGA")) or (
-                brand == "intel" and soc.startswith("AM")
-            ):
-                filters.pop("socket", None)
-    # Sort by core_count desc within budget - "the most cores you can afford"
-    results = search_components_impl("cpu", filters=filters,
-                                     sort_by="core_count", ascending=False, top_k=10)
-    if not results and platform != "ANY":
-        # Relax platform constraint
-        filters.pop("socket", None)
-        results = search_components_impl("cpu", filters=filters,
-                                         sort_by="core_count", ascending=False, top_k=10)
+        base_filters["name_contains"] = brand.upper() if brand == "amd" else "Intel"
+
+    # ---- Build the candidate-socket list ----
+    # 1. Explicit platform_preference (planner / brand) wins.
+    # 2. Otherwise restrict to mainstream sockets so the motherboard picker
+    #    always has plenty of in-budget boards to pair the CPU with.
+    candidate_sockets: list[str] = []
+    if platform != "ANY":
+        # Drop conflicting socket vs brand (e.g. AM5 + Intel).
+        if brand == "amd" and platform.startswith("LGA"):
+            candidate_sockets = ["AM5", "AM4"]
+        elif brand == "intel" and platform.startswith("AM"):
+            candidate_sockets = ["LGA1700", "LGA1200"]
+        else:
+            candidate_sockets = [platform]
+    else:
+        # No explicit platform - constrain to mainstream sockets, optionally
+        # filtered by brand.
+        if brand == "amd":
+            candidate_sockets = ["AM5", "AM4"]
+        elif brand == "intel":
+            candidate_sockets = ["LGA1700", "LGA1200"]
+        else:
+            candidate_sockets = list(_MAINSTREAM_SOCKETS)
+
+    # Try sockets in order, keeping the best-cored result.
+    results: list = []
+    for sock in candidate_sockets:
+        f = {**base_filters, "socket": sock}
+        r = search_components_impl(
+            "cpu", filters=f, sort_by="core_count", ascending=False, top_k=10
+        )
+        if r:
+            results = r
+            break
+
+    # Fallbacks: drop platform, then drop brand.
+    if not results:
+        results = search_components_impl(
+            "cpu", filters=base_filters,
+            sort_by="core_count", ascending=False, top_k=10,
+        )
     if not results and brand:
-        # Brand preference left zero matches - relax it as a last resort
-        # rather than failing the build.
-        filters.pop("name_contains", None)
+        base_filters.pop("name_contains", None)
         log.info("node.select.brand_relaxed", brand=brand, category="cpu")
-        results = search_components_impl("cpu", filters=filters,
-                                         sort_by="core_count", ascending=False, top_k=10)
+        results = search_components_impl(
+            "cpu", filters=base_filters,
+            sort_by="core_count", ascending=False, top_k=10,
+        )
     if not results:
         return None
     # Pick the highest-core, then highest-boost option that has a known socket
@@ -966,14 +1117,18 @@ def _pick_storage(plan, reqs, build) -> Dict[str, Any] | None:
 def _pick_psu(plan, reqs, build) -> Dict[str, Any] | None:
     from src.compatibility.power_rules import estimate_load_watts
     build_obj = _build_obj(build)
-    needed = max(450, estimate_load_watts(build_obj))
+    load = estimate_load_watts(build_obj)
+    # Compat check requires PSU >= load * 1.10. Target an even higher
+    # wattage (load * 1.15) so the chosen PSU clears the bar with margin.
+    needed = max(450, int(round(load * 1.15)))
     budget = plan["budget_allocation"]["power_supply"] * 1.3
     budget = _category_price_ceiling(reqs, "power_supply", budget)
     filters = {"price_lte": budget, "wattage_gte": needed}
     results = search_components_impl("power_supply", filters=filters,
                                      sort_by="wattage", ascending=True, top_k=10)
     if not results:
-        # Relax budget if no PSU is big enough
+        # Relax budget if no PSU is big enough - we'd rather slightly bust
+        # the per-category allocation than ship an undersized PSU.
         filters.pop("price_lte", None)
         results = search_components_impl("power_supply", filters=filters,
                                          sort_by="price", ascending=True, top_k=10)
@@ -1044,26 +1199,56 @@ def _pick_relaxed(
     spent = sum(float(c.get("price", 0) or 0) for c in build.values() if c)
     headroom = max(50, budget_total - spent)
 
-    if cat == "motherboard" and build.get("cpu"):
-        socket = build["cpu"].get("socket")
-        if socket:
-            results = search_components_impl(
-                "motherboard",
-                filters={"socket": socket, "price_lte": headroom},
-                sort_by="price",
-                ascending=True,
-                top_k=5,
-            )
-            return results[0] if results else None
+    if cat == "motherboard":
+        # NEVER fall through to a socket-blind fallback here. A mismatched
+        # motherboard creates a non-functional build. If the CPU has no
+        # socket info or no compatible board fits, return None and let
+        # component_selector log the gap.
+        cpu = build.get("cpu") or {}
+        socket = cpu.get("socket")
+        if not socket:
+            return None
+        results = search_components_impl(
+            "motherboard",
+            filters={"socket": socket, "price_lte": headroom},
+            sort_by="price",
+            ascending=True,
+            top_k=5,
+        )
+        if results:
+            return results[0]
+        # Last resort: relax price ceiling (a real $300 LGA1851 board is
+        # better than no board) so the build is at least functional.
+        results = search_components_impl(
+            "motherboard",
+            filters={"socket": socket},
+            sort_by="price",
+            ascending=True,
+            top_k=5,
+        )
+        return results[0] if results else None
 
-    if cat == "memory" and build.get("motherboard"):
-        ddr = build["motherboard"].get("ddr_gen")
+    if cat == "memory":
+        # Memory MUST match the motherboard's DDR generation. If no
+        # motherboard exists yet, we cannot safely pick memory.
+        mb = build.get("motherboard") or {}
+        if not mb:
+            return None
         filters: Dict[str, Any] = {"price_lte": headroom}
+        ddr = mb.get("ddr_gen")
         if ddr:
             filters["ddr_gen"] = ddr
         results = search_components_impl(
             "memory", filters=filters, sort_by="price", ascending=True, top_k=10
         )
+        if results:
+            return results[0]
+        # Relax: drop price ceiling but keep DDR generation constraint.
+        if ddr:
+            results = search_components_impl(
+                "memory", filters={"ddr_gen": ddr},
+                sort_by="price", ascending=True, top_k=5,
+            )
         return results[0] if results else None
 
     if cat == "video_card":
@@ -1130,26 +1315,68 @@ def _try_upgrade(category: str, current: Dict[str, Any], ceiling: float,
         return results[0] if results else None
 
     if category == "cpu":
+        # CRITICAL: a CPU upgrade must stay on the SAME socket as the existing
+        # motherboard, otherwise we silently create a build with a CPU/mobo
+        # mismatch (e.g. AM4 board + LGA1851 Core Ultra). If no motherboard
+        # exists yet, fall back to platform_preference; if that's "ANY",
+        # restrict to mainstream sockets only.
+        mb = build.get("motherboard") or {}
+        mb_socket = (mb.get("socket") or "").upper()
         platform = (plan.get("platform_preference") or "any").upper()
         filters: Dict[str, Any] = {
             "price_lte": ceiling,
             "price_gte": cur_price * 1.15,
         }
-        if platform != "ANY":
-            filters["socket"] = platform
         if not _need_discrete_gpu(reqs):
             filters["has_integrated_graphics"] = True
-        results = search_components_impl(
-            "cpu", filters=filters, sort_by="core_count", ascending=False, top_k=5
-        )
-        return results[0] if results else None
+        brand = (reqs.get("cpu_brand_preference") or "").lower()
+        if brand in ("amd", "intel"):
+            filters["name_contains"] = brand.upper() if brand == "amd" else "Intel"
+        if mb_socket:
+            filters["socket"] = mb_socket
+            results = search_components_impl(
+                "cpu", filters=filters, sort_by="core_count", ascending=False, top_k=5,
+            )
+            return results[0] if results else None
+        # No motherboard yet (uncommon during upgrade pass) - try each mainstream
+        # socket in order so we don't accidentally pick an edge-case CPU.
+        sockets = ([platform] if platform != "ANY" else list(_MAINSTREAM_SOCKETS))
+        for s in sockets:
+            f = {**filters, "socket": s}
+            r = search_components_impl(
+                "cpu", filters=f, sort_by="core_count", ascending=False, top_k=5,
+            )
+            if r:
+                return r[0]
+        return None
 
     if category == "memory":
+        # CRITICAL: keep the DDR generation in sync with the motherboard AND
+        # respect the board's max_memory and memory_slots so we don't
+        # silently violate physical limits.
         mb = build.get("motherboard") or {}
         filters = {"price_lte": ceiling, "price_gte": cur_price * 1.15}
         ddr = mb.get("ddr_gen")
         if ddr:
             filters["ddr_gen"] = ddr
+        # Don't blow past use-case appropriate memory caps even when filling.
+        use_case = reqs.get("use_case", "general")
+        if use_case in ("content_creation", "workstation"):
+            use_cap = 128
+        elif use_case == "gaming":
+            use_cap = 64
+        else:
+            use_cap = 32
+        # Hard cap = MIN of (use-case soft cap, motherboard max_memory).
+        mb_max = mb.get("max_memory")
+        if mb_max and float(mb_max) > 0:
+            filters["total_gb_lte"] = min(use_cap, int(mb_max))
+        else:
+            filters["total_gb_lte"] = use_cap
+        # Slot constraint: kit's module_count must fit in the board's slots.
+        slots = mb.get("memory_slots")
+        if slots:
+            filters["module_count_lte"] = int(slots)
         results = search_components_impl(
             "memory", filters=filters, sort_by="total_gb", ascending=False, top_k=5
         )
@@ -1219,7 +1446,7 @@ def _budget_fill_pass(build: Dict[str, Any], plan: Dict[str, Any],
     for _pass in range(2):
         for cat in order:
             if total_now() >= target:
-                return build
+                break
             current = build.get(cat)
             if not current:
                 continue
@@ -1240,7 +1467,39 @@ def _budget_fill_pass(build: Dict[str, Any], plan: Dict[str, Any],
                         delta=round(delta, 2),
                     )
                     build[cat] = upgrade
+
+    # After upgrades, the CPU/GPU TDP may have grown, leaving the PSU
+    # undersized. Re-pick the PSU against the latest build to keep
+    # compatibility checks clean.
+    _ensure_psu_sized(build, plan, reqs)
     return build
+
+
+def _ensure_psu_sized(build: Dict[str, Any], plan: Dict[str, Any],
+                      reqs: Dict[str, Any]) -> None:
+    """If the current PSU can't handle the upgraded build, re-pick it."""
+    from src.compatibility.power_rules import estimate_load_watts
+    psu = build.get("power_supply")
+    if not psu:
+        return
+    try:
+        load = estimate_load_watts(_build_obj(build))
+    except Exception:
+        return
+    cur_w = float(psu.get("wattage") or 0)
+    if cur_w >= load * 1.10:  # 10% safety margin -> we're good
+        return
+    new_psu = _pick_psu(plan, reqs, build)
+    if new_psu and float(new_psu.get("wattage") or 0) >= load * 1.10:
+        log.info(
+            "node.select.psu_resized",
+            old=psu.get("name"),
+            old_w=cur_w,
+            new=new_psu.get("name"),
+            new_w=new_psu.get("wattage"),
+            load=round(load, 1),
+        )
+        build["power_supply"] = new_psu
 
 
 # ---------------------------------------------------------------------------
@@ -1260,10 +1519,15 @@ def _try_downgrade(category: str, current: Dict[str, Any], max_price: float,
         return None  # nothing meaningful to gain
 
     if category == "cpu":
+        # Downgrade must stay on the existing motherboard's socket.
+        mb = build.get("motherboard") or {}
+        mb_socket = (mb.get("socket") or "").upper()
         platform = (plan.get("platform_preference") or "any").upper()
         need_igpu = not _need_discrete_gpu(reqs)
         filters: Dict[str, Any] = {"price_lte": max_price, "price_gte": 40}
-        if platform != "ANY":
+        if mb_socket:
+            filters["socket"] = mb_socket
+        elif platform != "ANY":
             filters["socket"] = platform
         if need_igpu:
             filters["has_integrated_graphics"] = True
@@ -1273,7 +1537,7 @@ def _try_downgrade(category: str, current: Dict[str, Any], max_price: float,
         results = search_components_impl(
             "cpu", filters=filters, sort_by="core_count", ascending=False, top_k=5
         )
-        if not results and platform != "ANY":
+        if not results and (mb_socket or platform != "ANY"):
             filters.pop("socket", None)
             results = search_components_impl(
                 "cpu", filters=filters, sort_by="core_count", ascending=False, top_k=5
@@ -1290,6 +1554,12 @@ def _try_downgrade(category: str, current: Dict[str, Any], max_price: float,
         results = search_components_impl(
             "memory", filters=filters, sort_by="total_gb", ascending=True, top_k=5
         )
+        if not results and target_gb > 8:
+            # Relax target if too aggressive (e.g. low-budget builds)
+            filters["total_gb_gte"] = 8
+            results = search_components_impl(
+                "memory", filters=filters, sort_by="total_gb", ascending=True, top_k=5
+            )
         return results[0] if results else None
 
     if category == "storage":
@@ -1364,15 +1634,18 @@ def _budget_trim_pass(build: Dict[str, Any], plan: Dict[str, Any],
         "cpu_cooler", "case", "power_supply", "video_card",
         "memory", "storage", "cpu",
     )
-    max_iters = 12
+    uncuttable: set[str] = set()  # categories that have no cheaper alternative
+    max_iters = 14
     for _i in range(max_iters):
         over = total_now() - budget
         if over <= 0:
             return build
-        # Pick the highest-priced flexible category that still has room to cut.
+        # Pick the highest-priced flexible category still considered cuttable.
         target_cat: str | None = None
         target_price = 0.0
         for cat in PREFER_ORDER:
+            if cat in uncuttable:
+                continue
             comp = build.get(cat)
             if not comp:
                 continue
@@ -1381,20 +1654,26 @@ def _budget_trim_pass(build: Dict[str, Any], plan: Dict[str, Any],
                 target_cat = cat
                 target_price = p
         if not target_cat:
-            break
+            break  # every category is either tiny or already at its floor
 
-        max_price = max(15.0, target_price - over - 1)  # absorb the full overage
+        # Accept progressively more aggressive cuts: first try to absorb the
+        # whole overage, then settle for ANY cheaper alternative.
         new_pick = _try_downgrade(
-            target_cat, build[target_cat], max_price, plan, reqs, build
+            target_cat, build[target_cat],
+            max(15.0, target_price - over - 1),
+            plan, reqs, build,
         )
         if not new_pick or new_pick.get("name") == build[target_cat].get("name"):
-            # No cheaper alternative for this category. Skip it next round
-            # by temporarily dropping its price contribution from consideration.
+            # Fall back: try for any cheaper alternative at all (10% off).
+            new_pick = _try_downgrade(
+                target_cat, build[target_cat],
+                max(15.0, target_price * 0.90),
+                plan, reqs, build,
+            )
+        if not new_pick or new_pick.get("name") == build[target_cat].get("name"):
             log.info("node.select.trim_no_cheaper", category=target_cat)
-            # Mark as immovable for this loop by tagging name (handled by
-            # checking equality above on next iteration is unreliable, so
-            # break to avoid infinite loop if every category is at floor).
-            break
+            uncuttable.add(target_cat)
+            continue
         log.info(
             "node.select.budget_trim",
             category=target_cat,
@@ -1454,6 +1733,9 @@ def component_selector(state: AgentState) -> Dict[str, Any]:
     # should bring it back in line. This runs on every attempt because a
     # critique-driven re-pick can also bust the budget.
     build = _budget_trim_pass(build, plan, reqs)
+    # Final guard: make sure the PSU can still handle the (possibly trimmed)
+    # build.
+    _ensure_psu_sized(build, plan, reqs)
 
     log.info(
         "node.select.done",
@@ -1991,6 +2273,19 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
     # previous turn so they do not silently keep capping picks forever.
     reqs.pop("category_price_ceilings", None)
     deltas = fb.get("delta_constraints") or {}
+
+    # ---- Relative budget moves: "double my budget" / "halve it" ----
+    mult = deltas.pop("budget_multiplier", None)
+    if mult is not None:
+        cur = float(reqs.get("budget_usd") or 0)
+        if cur > 0:
+            new_budget = round(cur * float(mult), 2)
+            deltas["budget_usd"] = new_budget
+            log.info("node.feedback.budget_multiplier",
+                     multiplier=mult, old=cur, new=new_budget)
+        else:
+            log.warning("node.feedback.budget_multiplier_no_current_budget",
+                        multiplier=mult)
 
     # Translate the relative "make it cheaper" signal into a concrete
     # budget reduction. Target ~80% of the LOWER of (current build total,
