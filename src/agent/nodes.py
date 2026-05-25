@@ -337,19 +337,24 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
     # Trigger when the user mentions AMD/Intel near a CPU-related keyword
     # OR uses Ryzen / Core (which are unambiguously CPU brand markers).
     # Examples: "i want AMD cpu not intel", "swap Intel cpu with AMD",
-    # "give me ryzen instead", "use intel processor".
+    # "give me ryzen instead", "use intel processor", "update to AMD",
+    # "upgrade the cpu to ryzen", "go with intel".
     cpu_kw = re.search(r"\b(cpu|processor|ryzen|core\s?i\d|core\s?ultra)\b", t)
     has_amd = re.search(r"\b(amd|ryzen)\b", t) is not None
     has_intel = re.search(r"\b(intel|core\s?i\d|core\s?ultra)\b", t) is not None
+    SWAP_VERBS = (
+        "swap", "replace", "change", "switch", "update", "upgrade",
+        "use", "give", "make", "go", "pick", "want", "prefer", "rather",
+    )
+    has_swap_verb = any(re.search(rf"\b{re.escape(v)}\b", t) for v in SWAP_VERBS)
     if cpu_kw or has_amd or has_intel:
         # Prefer AMD if the user wrote "amd ... not intel" or "amd instead",
         # or if only AMD markers are present.
         wants_amd = (
             has_amd and (
                 re.search(r"\bnot\s+intel\b", t) or
-                "instead" in t or "rather" in t or
-                "swap" in t or "replace" in t or "change" in t or
-                "switch" in t or "want" in t or "prefer" in t or
+                "instead" in t or
+                has_swap_verb or
                 not has_intel
             )
         )
@@ -357,7 +362,7 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
             has_intel and not wants_amd and (
                 re.search(r"\bnot\s+amd\b", t) or
                 "instead" in t or
-                "want" in t or "prefer" in t or
+                has_swap_verb or
                 not has_amd
             )
         )
@@ -377,26 +382,40 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
             }
 
     # ---- Generic "change X" requests ----
+    # Look for "<change-verb> ... <component-noun>" in either order.
+    # Aliases are intentionally broad so user wording like "graphics card",
+    # "power supply", "heatsink", "drive", "mobo" all work.
     component_synonyms = {
-        "cpu": ("cpu", "processor"),
-        "video_card": ("gpu", "video card"),  # avoid bare "card"
-        "memory": ("ram", "memory"),
-        "storage": ("storage", "ssd", "hdd", "disk", "nvme"),
-        "motherboard": ("motherboard", "mobo"),
-        "power_supply": ("psu",),
-        "case": ("case", "chassis", "tower"),
-        "cpu_cooler": ("cooler", "fan"),
+        "video_card": (
+            "gpu", "video card", "graphics card", "graphics", "vga",
+        ),  # keep before "cpu" so "graphics card" isn't shadowed
+        "cpu_cooler": (
+            "cooler", "cpu cooler", "heatsink", "aio", "liquid cooler",
+        ),
+        "cpu": ("cpu", "processor", "chip"),
+        "memory": ("ram", "memory", "ddr"),
+        "storage": (
+            "storage", "ssd", "hdd", "disk", "drive", "nvme", "m.2",
+        ),
+        "motherboard": ("motherboard", "mobo", "mainboard", "board"),
+        "power_supply": ("psu", "power supply", "power-supply", "power_supply"),
+        "case": ("case", "chassis", "tower", "enclosure"),
     }
-    change_verbs = ("change", "swap", "replace", "different", "another", "new")
-    for cat, kws in component_synonyms.items():
-        if any(re.search(rf"\b{re.escape(kw)}\b", t) for kw in kws) and any(
-            re.search(rf"\b{re.escape(v)}\b", t) for v in change_verbs
-        ):
-            return {
-                "intent": "swap_part",
-                "delta_constraints": {},
-                "target_categories": [cat],
-            }
+    change_verbs = (
+        "change", "swap", "replace", "different", "another", "new",
+        "update", "upgrade", "switch", "use", "pick",
+    )
+    has_change_verb = any(
+        re.search(rf"\b{re.escape(v)}\b", t) for v in change_verbs
+    )
+    if has_change_verb:
+        for cat, kws in component_synonyms.items():
+            if any(re.search(rf"\b{re.escape(kw)}\b", t) for kw in kws):
+                return {
+                    "intent": "swap_part",
+                    "delta_constraints": {},
+                    "target_categories": [cat],
+                }
 
     return None
 
