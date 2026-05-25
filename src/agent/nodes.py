@@ -456,8 +456,12 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
             "delta_constraints": {"noise_preference": "quiet"},
             "target_categories": ["cpu_cooler", "case"],
         }
-    if any(s in t for s in ("more storage", "bigger ssd", "larger ssd",
-                              "more disk", "bigger drive")):
+    if any(s in t for s in (
+        "more storage", "bigger ssd", "larger ssd",
+        "larger storage", "bigger storage", "larger drive",
+        "more disk", "bigger drive", "more space", "more capacity",
+        "larger capacity", "bigger capacity",
+    )):
         return {
             "intent": "swap_part",
             "delta_constraints": {"storage_capacity_gte": 2000},
@@ -520,9 +524,14 @@ def _heuristic_feedback(user_text: str) -> Dict[str, Any] | None:
     # Examples: "i want AMD cpu not intel", "swap Intel cpu with AMD",
     # "give me ryzen instead", "use intel processor", "update to AMD",
     # "upgrade the cpu to ryzen", "go with intel".
-    cpu_kw = re.search(r"\b(cpu|processor|ryzen|core\s?i\d|core\s?ultra)\b", t)
-    has_amd = re.search(r"\b(amd|ryzen)\b", t) is not None
-    has_intel = re.search(r"\b(intel|core\s?i\d|core\s?ultra)\b", t) is not None
+    cpu_kw = re.search(
+        r"\b(cpu|processor|ryzen|core\s?i\d|core\s?ultra|i[3579])\b", t
+    )
+    has_amd = re.search(r"\b(amd|ryzen|threadripper)\b", t) is not None
+    has_intel = re.search(
+        r"\b(intel|core\s?i\d|core\s?ultra|i[3579](?:-\d{4,5})?|pentium|celeron)\b",
+        t,
+    ) is not None
     SWAP_VERBS = (
         "swap", "replace", "change", "switch", "update", "upgrade",
         "use", "give", "make", "go", "pick", "want", "prefer", "rather",

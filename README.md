@@ -1,8 +1,13 @@
 # PC Builder Agent
 
-> Agentic AI system that gathers user requirements, reasons over a real components catalog, and produces a **compatible** PC build. Two zero-cost runtime options out of the box: **Groq** (hosted, free tier, serves open-source models like Llama 3.3) or **Ollama** (fully local, no API key).
+> Agentic AI system that gathers user requirements, reasons over a real components catalog, and produces a **compatible** PC build. Multiple zero-cost runtime options out of the box, including **GitHub Models** (default, corporate-firewall friendly), **Groq**, **HuggingFace**, **Cerebras**, and **Ollama** (fully local).
 
-Built for the GenAI engineering take-home assignment. See `docs/agent_run_report.md` for the full architecture write-up and a captured agent trace.
+Built for the GenAI engineering take-home assignment.
+
+**Reviewers — start here:** [`docs/SUBMISSION.md`](docs/SUBMISSION.md) (also rendered to [`docs/SUBMISSION.pdf`](docs/SUBMISSION.pdf)). It contains:
+- the complete deliverables checklist,
+- a **curated list of sample inputs** that produce clean, well-formed results (try those first),
+- the architecture diagram, design decisions, robustness audit, and pointers to the captured agent trace.
 
 ---
 
@@ -199,6 +204,19 @@ streamlit run src/ui/streamlit_app.py
 ```
 
 The sidebar shows the live build with a real-time compatibility status.
+
+**What to type first?** See the [sample inputs section](docs/SUBMISSION.md#3-sample-user-inputs-works-well--try-these-first) of the submission document. Good single-shot starters:
+
+- `Build me a 1440p gaming PC for $1500`
+- `Office PC, budget $700`
+- `Content creation rig, $2500`
+
+After any build is shown, try follow-ups like:
+
+- `swap to AMD CPU` / `swap to NVIDIA video card`
+- `cheaper` / `quieter` / `more storage` / `more ram`
+- `compare with $900 budget` / `double my budget`
+- `approve` (to wrap up)
 
 ### Docker (one-shot, everything included)
 

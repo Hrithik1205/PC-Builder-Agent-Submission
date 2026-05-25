@@ -37,3 +37,6 @@ langgraph-checkpoint-sqlite>=2.0.0
 
 # Tests / eval
 pytest>=8.3.0
+
+# Docs - regenerates docs/SUBMISSION.pdf from docs/SUBMISSION.md
+markdown-pdf>=1.13.0
