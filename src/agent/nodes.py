@@ -78,35 +78,94 @@ def _few_shot_messages(fewshots: List[Dict[str, Any]]):
     return msgs
 
 
-def _extract_budget_usd(user_text: str) -> float | None:
-    """Parse budget from user text without confusing 1440p / 1080p with dollars."""
+def _extract_budget_range(user_text: str) -> tuple[float | None, float | None]:
+    """Parse `(min, max)` budget. Returns `(None, max)` if only a single value.
+
+    Avoids confusing display resolutions (1440p, 1080p, 4K) with dollars.
+    """
     text = user_text.replace(",", "")
-    patterns = [
+    # Patterns that capture an explicit range.
+    range_patterns = [
+        r"\$?\s*(\d{2,5})\s*(?:-|to|and)\s*\$?\s*(\d{2,5})",
+        r"between\s*\$?\s*(\d{2,5})\s*(?:and|to)\s*\$?\s*(\d{2,5})",
+    ]
+    for pat in range_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            lo, hi = float(m.group(1)), float(m.group(2))
+            if lo > hi:
+                lo, hi = hi, lo
+            if 150 <= lo <= 25000 and 150 <= hi <= 25000 and hi - lo < hi:
+                return lo, hi
+    # Single-value patterns (preferred over loose digit matches).
+    single_patterns = [
         r"\$\s*(\d{2,5})\b",
         r"(?:for|budget)\s*\$?\s*(\d{2,5})\b",
         r"(\d{2,5})\s*(?:usd|dollars?)\b",
     ]
-    for pat in patterns:
+    for pat in single_patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             val = float(m.group(1))
             if 150 <= val <= 25000:
-                return val
-    # Numbers not immediately followed by 'p' (avoids 1440p, 1080p)
+                return None, val
+    # Loose fallback: any 3-5 digit number not followed by 'p' (skip 1440p, 4K).
     for m in re.finditer(r"(?<!\d)(\d{3,5})(?!p\b)", text, re.IGNORECASE):
         val = float(m.group(1))
         if 150 <= val <= 25000:
-            return val
-    return None
+            return None, val
+    return None, None
+
+
+def _extract_budget_usd(user_text: str) -> float | None:
+    """Back-compat wrapper: return only the upper bound."""
+    _, hi = _extract_budget_range(user_text)
+    return hi
+
+
+# Keywords that strongly indicate a non-PC topic (used as a heuristic
+# off-topic deflection when the LLM is unavailable or returned no flag).
+_OFF_TOPIC_HINTS = re.compile(
+    r"\b(weather|forecast|recipe|cook(?:ing|ery)?|joke|poem|story|"
+    r"translat\w*|who won|movie|song|lyrics|capital of|"
+    r"president|prime minister|stock price)\b|\b2\s*\+\s*2\b",
+    re.IGNORECASE,
+)
+# Cheap positive signal that we're discussing PC hardware.
+_ON_TOPIC_HINTS = re.compile(
+    r"\b(pc|computer|build|gaming|workstation|cpu|gpu|ram|memory|"
+    r"motherboard|psu|ssd|nvme|case|cooler|tower|amd|intel|nvidia|"
+    r"radeon|geforce|ryzen|core\s?ultra|am[45]|lga\s?\d|ddr[45]|"
+    r"1080p|1440p|4k|fps|render|stream|edit|davinci|premiere)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_off_topic(text: str) -> bool:
+    """Conservative heuristic - only flags clearly off-topic short messages."""
+    if not text or len(text) > 300:
+        return False
+    if _ON_TOPIC_HINTS.search(text):
+        return False
+    return bool(_OFF_TOPIC_HINTS.search(text))
+
+
+OFF_TOPIC_REPLY = (
+    "I can't help with that - I can only assist you with building a PC. "
+    "Tell me about the kind of PC you'd like and your budget, and I'll "
+    "design a compatible build for you."
+)
 
 
 def _heuristic_requirements(user_text: str, base: Dict[str, Any]) -> Dict[str, Any]:
-    """Fill gaps when Ollama is down and the LLM could not parse requirements."""
+    """Fill gaps when the LLM is down and could not parse requirements."""
     t = user_text.lower()
     if base.get("budget_usd") is None:
-        b = _extract_budget_usd(user_text)
-        if b is not None:
-            base["budget_usd"] = b
+        lo, hi = _extract_budget_range(user_text)
+        if hi is not None:
+            base["budget_usd"] = hi
+        if lo is not None and base.get("budget_min_usd") is None:
+            base["budget_min_usd"] = lo
     if base.get("use_case") == "general":
         if any(w in t for w in ("gaming", "game", "1440p", "1080p", "fps")):
             base["use_case"] = "gaming"
@@ -136,6 +195,12 @@ def requirement_gatherer(state: AgentState) -> Dict[str, Any]:
             "mode": "respond",
         }
 
+    # Fast-path heuristic off-topic deflection. Saves an LLM call for the
+    # obvious cases ("what's the weather?", "tell me a joke", etc.).
+    if _looks_off_topic(user_text):
+        log.info("node.gather.off_topic_heuristic")
+        return {"final_response": OFF_TOPIC_REPLY, "mode": "respond"}
+
     msgs = [SystemMessage(content=REQUIREMENT_GATHERER_SYSTEM)]
     msgs.extend(_few_shot_messages(REQUIREMENT_GATHERER_FEWSHOTS))
     history = state.get("messages", [])
@@ -144,9 +209,16 @@ def requirement_gatherer(state: AgentState) -> Dict[str, Any]:
     ai = invoke_with_retry(msgs, temperature=0.0)
     parsed = _parse_json_safely(ai.content) or {}
 
+    # LLM-flagged off-topic - return the standard refusal.
+    if parsed.get("is_on_topic") is False:
+        log.info("node.gather.off_topic_llm")
+        return {"final_response": OFF_TOPIC_REPLY, "mode": "respond"}
+
     requirements = {
+        "is_on_topic": parsed.get("is_on_topic", True),
         "use_case": parsed.get("use_case", "general"),
         "budget_usd": parsed.get("budget_usd"),
+        "budget_min_usd": parsed.get("budget_min_usd"),
         "budget_flexible": bool(parsed.get("budget_flexible", False)),
         "noise_preference": parsed.get("noise_preference"),
         "form_factor_preference": parsed.get("form_factor_preference", "any"),
@@ -160,15 +232,19 @@ def requirement_gatherer(state: AgentState) -> Dict[str, Any]:
     # When the LLM is unavailable (or returned junk), parse budget/use-case from text.
     if not parsed or "unable to reach the language model" in (ai.content or "").lower():
         requirements = _heuristic_requirements(user_text, requirements)
-    elif requirements.get("budget_usd") is None:
-        b = _extract_budget_usd(user_text)
-        if b is not None:
-            requirements["budget_usd"] = b
+    else:
+        # Backfill budget from text if the LLM missed it / didn't see a range.
+        lo, hi = _extract_budget_range(user_text)
+        if requirements.get("budget_usd") is None and hi is not None:
+            requirements["budget_usd"] = hi
+        if requirements.get("budget_min_usd") is None and lo is not None:
+            requirements["budget_min_usd"] = lo
 
     log.info(
         "node.gather.done",
         confidence=requirements["confidence"],
         budget=requirements["budget_usd"],
+        budget_min=requirements.get("budget_min_usd"),
         use_case=requirements["use_case"],
         elapsed_ms=int((time.time() - t0) * 1000),
     )
@@ -520,6 +596,136 @@ def _build_obj(build_dict: Dict[str, Any]) -> Build:
     return Build(**(build_dict or {}))
 
 
+# ---------------------------------------------------------------------------
+# Budget-fill pass: upgrade weakest parts when the build is well under budget
+# ---------------------------------------------------------------------------
+
+def _try_upgrade(category: str, current: Dict[str, Any], ceiling: float,
+                 plan: Dict[str, Any], reqs: Dict[str, Any],
+                 build: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Find a more-premium component within `ceiling`. Returns None if no real
+    upgrade is possible (i.e. ceiling barely above current price).
+    """
+    cur_price = float(current.get("price", 0) or 0)
+    if ceiling <= cur_price * 1.10:  # need at least 10% headroom for a real upgrade
+        return None
+
+    if category == "video_card":
+        results = search_components_impl(
+            "video_card",
+            filters={"price_lte": ceiling, "price_gte": cur_price * 1.15},
+            sort_by="estimated_tdp", ascending=False,
+            top_k=5,
+        )
+        return results[0] if results else None
+
+    if category == "cpu":
+        platform = (plan.get("platform_preference") or "any").upper()
+        filters: Dict[str, Any] = {
+            "price_lte": ceiling,
+            "price_gte": cur_price * 1.15,
+        }
+        if platform != "ANY":
+            filters["socket"] = platform
+        if not _need_discrete_gpu(reqs):
+            filters["has_integrated_graphics"] = True
+        results = search_components_impl(
+            "cpu", filters=filters, sort_by="core_count", ascending=False, top_k=5
+        )
+        return results[0] if results else None
+
+    if category == "memory":
+        mb = build.get("motherboard") or {}
+        filters = {"price_lte": ceiling, "price_gte": cur_price * 1.15}
+        ddr = mb.get("ddr_gen")
+        if ddr:
+            filters["ddr_gen"] = ddr
+        results = search_components_impl(
+            "memory", filters=filters, sort_by="total_gb", ascending=False, top_k=5
+        )
+        return results[0] if results else None
+
+    if category == "storage":
+        results = search_components_impl(
+            "storage",
+            filters={
+                "price_lte": ceiling,
+                "price_gte": cur_price * 1.15,
+                "type_contains": "SSD",
+            },
+            sort_by="capacity", ascending=False,
+            top_k=5,
+        )
+        return results[0] if results else None
+
+    if category == "power_supply":
+        results = search_components_impl(
+            "power_supply",
+            filters={"price_lte": ceiling, "price_gte": cur_price * 1.15},
+            sort_by="wattage", ascending=False,
+            top_k=5,
+        )
+        return results[0] if results else None
+
+    return None
+
+
+def _budget_fill_pass(build: Dict[str, Any], plan: Dict[str, Any],
+                      reqs: Dict[str, Any]) -> Dict[str, Any]:
+    """Upgrade high-impact components if the build is well under budget.
+
+    Aims for ~90% budget utilization. Upgrade priority depends on use case
+    (gaming -> GPU first; content creation -> CPU/memory first).
+    """
+    budget = float(reqs.get("budget_usd") or 0)
+    if not budget:
+        return build
+
+    def total_now() -> float:
+        return round(sum(float(c.get("price", 0) or 0) for c in build.values() if c), 2)
+
+    target = budget * 0.90  # land near 90% of budget upper bound
+    floor = budget * 0.85   # but at least 85%
+
+    if total_now() >= floor:
+        return build
+
+    use_case = reqs.get("use_case", "general")
+    if use_case == "gaming":
+        order = ["video_card", "cpu", "memory", "storage", "power_supply"]
+    elif use_case in ("content_creation", "workstation"):
+        order = ["cpu", "memory", "video_card", "storage", "power_supply"]
+    else:
+        order = ["cpu", "memory", "storage", "video_card", "power_supply"]
+
+    # Two passes: first try to reach target, then push as close as possible.
+    for _pass in range(2):
+        for cat in order:
+            if total_now() >= target:
+                return build
+            current = build.get(cat)
+            if not current:
+                continue
+            headroom = budget - total_now()
+            if headroom <= 5:
+                continue
+            cur_price = float(current.get("price", 0) or 0)
+            new_ceiling = cur_price + headroom  # we'll absorb the full delta if we upgrade
+            upgrade = _try_upgrade(cat, current, new_ceiling, plan, reqs, build)
+            if upgrade and upgrade.get("name") != current.get("name"):
+                delta = float(upgrade.get("price", 0) or 0) - cur_price
+                if delta > 0:
+                    log.info(
+                        "node.select.budget_fill",
+                        category=cat,
+                        old=current.get("name"),
+                        new=upgrade.get("name"),
+                        delta=round(delta, 2),
+                    )
+                    build[cat] = upgrade
+    return build
+
+
 def component_selector(state: AgentState) -> Dict[str, Any]:
     """Deterministic per-category picker that consults the search tool.
 
@@ -557,6 +763,12 @@ def component_selector(state: AgentState) -> Dict[str, Any]:
                      price=choice.get("price"))
         else:
             log.warning("node.select.no_choice", category=cat)
+
+    # If the build is significantly under budget, upgrade key parts.
+    # Skip on the second attempt (post-critique) so we don't overwrite the
+    # critique-driven re-pick.
+    if attempts == 1:
+        build = _budget_fill_pass(build, plan, reqs)
 
     log.info(
         "node.select.done",
@@ -714,6 +926,69 @@ def _format_build_response(
 # 6. responder
 # ---------------------------------------------------------------------------
 
+def _build_comparison_markdown(
+    prev: Dict[str, Any],
+    new: Dict[str, Any],
+    prev_budget: float | None,
+    new_budget: float | None,
+) -> str:
+    """Deterministic markdown diff. Always correct - used as a fallback when
+    the LLM omits the comparison section."""
+    if not prev:
+        return ""
+
+    def total_of(b: Dict[str, Any]) -> float:
+        return round(sum(float(c.get("price", 0) or 0) for c in (b or {}).values() if c), 2)
+
+    lines = ["### What changed vs your previous build"]
+    changed = 0
+    unchanged = 0
+    for cat in CATEGORY_ORDER:
+        old = prev.get(cat)
+        nxt = new.get(cat)
+        old_name = old.get("name") if old else None
+        nxt_name = nxt.get("name") if nxt else None
+        if old_name == nxt_name and old_name is not None:
+            unchanged += 1
+            continue
+        old_price = float(old.get("price", 0) or 0) if old else 0.0
+        nxt_price = float(nxt.get("price", 0) or 0) if nxt else 0.0
+        delta = nxt_price - old_price
+        sign = "+" if delta >= 0 else ""
+        if old_name and nxt_name:
+            lines.append(
+                f"- **{cat}**: {old_name} (${old_price:.2f}) -> "
+                f"{nxt_name} (${nxt_price:.2f}) [{sign}${delta:.2f}]"
+            )
+            changed += 1
+        elif nxt_name and not old_name:
+            lines.append(f"- **{cat}**: added {nxt_name} (${nxt_price:.2f})")
+            changed += 1
+        elif old_name and not nxt_name:
+            lines.append(f"- **{cat}**: removed {old_name} (was ${old_price:.2f})")
+            changed += 1
+
+    if changed == 0:
+        return ""  # no meaningful diff to show
+
+    if unchanged:
+        lines.append(f"- *Unchanged: {unchanged} component(s)*")
+
+    old_total = total_of(prev)
+    new_total = total_of(new)
+    total_delta = new_total - old_total
+    total_sign = "+" if total_delta >= 0 else ""
+    lines.append(
+        f"\n**Total:** ${old_total:.2f} -> ${new_total:.2f} "
+        f"({total_sign}${total_delta:.2f})"
+    )
+    if prev_budget and new_budget:
+        lines.append(
+            f"**Budget:** ${float(prev_budget):.0f} -> ${float(new_budget):.0f}"
+        )
+    return "\n".join(lines)
+
+
 def responder(state: AgentState) -> Dict[str, Any]:
     t0 = time.time()
     # Already-set short-circuit response (e.g. from gatherer asking questions)
@@ -726,6 +1001,8 @@ def responder(state: AgentState) -> Dict[str, Any]:
     reqs = state.get("requirements") or {}
     build = state.get("build") or {}
     issues = state.get("compat_issues", [])
+    prev_build = state.get("previous_build") or {}
+    prev_budget = state.get("previous_budget_usd")
 
     try:
         build_obj = Build(**{k: v for k, v in build.items() if v})
@@ -733,29 +1010,57 @@ def responder(state: AgentState) -> Dict[str, Any]:
         build_obj = Build()
     total = build_obj.total_price() if build else 0.0
 
+    # Compose the comparison section deterministically first, then ask the
+    # LLM to weave it into a friendly response. We append our deterministic
+    # version if the LLM happens to skip it.
+    comparison_md = _build_comparison_markdown(
+        prev_build, build, prev_budget, reqs.get("budget_usd")
+    )
+
+    human_parts = [
+        "Requirements:",
+        json.dumps(reqs, indent=2),
+        "",
+        "Selected build (full rows):",
+        json.dumps(build, indent=2, default=str),
+        "",
+        "Compatibility findings:",
+        summarize_issues([Issue(**i) for i in issues]),
+        "",
+        f"Total price: ${total}",
+        f"User budget: ${reqs.get('budget_usd', 'N/A')}",
+    ]
+    if comparison_md:
+        human_parts.extend([
+            "",
+            "Previous build (use this for the 'What changed' section):",
+            json.dumps(prev_build, indent=2, default=str),
+            f"Previous budget: ${prev_budget if prev_budget else 'N/A'}",
+            "",
+            "Pre-computed comparison (you MAY use this verbatim or rephrase):",
+            comparison_md,
+        ])
+    human_parts.append("\nNow write the user-facing response in Markdown.")
+
     msgs = [
         SystemMessage(content=RESPONDER_SYSTEM),
-        HumanMessage(content=(
-            "Requirements:\n"
-            f"{json.dumps(reqs, indent=2)}\n\n"
-            "Selected build (full rows):\n"
-            f"{json.dumps(build, indent=2, default=str)}\n\n"
-            "Compatibility findings:\n"
-            f"{summarize_issues([Issue(**i) for i in issues])}\n\n"
-            f"Total price: ${total}\n"
-            f"User budget: ${reqs.get('budget_usd', 'N/A')}\n\n"
-            "Now write the user-facing response in Markdown."
-        )),
+        HumanMessage(content="\n".join(human_parts)),
     ]
     ai = invoke_with_retry(msgs, temperature=0.3)
     content = ai.content or ""
     if "unable to reach the language model" in content.lower() and build:
         content = _format_build_response(reqs, build, issues, total)
 
+    # Safety net: if the LLM forgot the comparison section, append our
+    # deterministic one.
+    if comparison_md and "what changed" not in content.lower():
+        content = content.rstrip() + "\n\n" + comparison_md
+
     log.info(
         "node.respond.done",
         total_price=total,
         n_issues=len(issues),
+        has_previous=bool(prev_build),
         elapsed_ms=int((time.time() - t0) * 1000),
     )
     return {
@@ -777,6 +1082,11 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
     ok, reason = validate_user_message(user_text)
     if not ok:
         return {"final_response": reason, "mode": "respond"}
+
+    # Fast-path heuristic off-topic deflection on follow-up turns.
+    if _looks_off_topic(user_text):
+        log.info("node.feedback.off_topic_heuristic")
+        return {"final_response": OFF_TOPIC_REPLY, "mode": "respond"}
 
     msgs = [
         SystemMessage(content=FEEDBACK_SYSTEM),
@@ -805,37 +1115,66 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
             "final_response": "Glad it works for you. Happy building!",
             "mode": "respond",
         }
+    if intent == "off_topic":
+        return {
+            "feedback": fb,
+            "final_response": OFF_TOPIC_REPLY,
+            "mode": "respond",
+        }
     if intent == "unclear":
         return {
             "feedback": fb,
             "final_response": "I am not sure what you would like to change. "
                               "Try something like: 'make it cheaper', 'more "
-                              "storage', or 'quieter'.",
+                              "storage', 'quieter', or 'compare with a $900 budget'.",
             "mode": "respond",
         }
 
-    # Apply deltas to requirements + plan, drop target parts, then re-plan.
+    # Snapshot the existing build so the responder can produce a diff.
+    prev_build = dict(state.get("build") or {})
+    prev_budget = (state.get("requirements") or {}).get("budget_usd")
+
+    # Apply deltas to requirements + plan, then re-plan from scratch.
     reqs = dict(state.get("requirements") or {})
     deltas = fb.get("delta_constraints") or {}
     if "budget_usd" in deltas:
         reqs["budget_usd"] = deltas["budget_usd"]
+    if "budget_min_usd" in deltas:
+        reqs["budget_min_usd"] = deltas["budget_min_usd"]
     if "noise_preference" in deltas:
         reqs["noise_preference"] = deltas["noise_preference"]
+    # Backfill range from raw text if the LLM missed it.
+    lo, hi = _extract_budget_range(user_text)
+    if hi is not None and "budget_usd" not in deltas:
+        reqs["budget_usd"] = hi
+    if lo is not None and "budget_min_usd" not in deltas:
+        reqs["budget_min_usd"] = lo
+
     # Add explicit must-haves so the planner picks differently
     extra = []
     for k, v in deltas.items():
-        if k not in ("budget_usd", "noise_preference"):
+        if k not in ("budget_usd", "budget_min_usd", "noise_preference"):
             extra.append(f"{k}={v}")
     if extra:
         reqs["must_have"] = list(reqs.get("must_have") or []) + extra
 
-    build = dict(state.get("build") or {})
-    for cat in fb.get("target_categories") or []:
-        build.pop(cat, None)
+    # For budget changes or explicit compare requests, rebuild from scratch
+    # so the comparison reflects the budget swing across every category.
+    rebuild_full = intent in ("change_budget", "compare_builds") or (
+        "budget_usd" in deltas or "budget_min_usd" in deltas
+    )
+    if rebuild_full:
+        build: Dict[str, Any] = {}
+    else:
+        build = dict(state.get("build") or {})
+        for cat in fb.get("target_categories") or []:
+            build.pop(cat, None)
 
     return {
         "requirements": reqs,
         "build": build,
+        "previous_build": prev_build,
+        "previous_budget_usd": prev_budget,
         "feedback": fb,
         "selector_attempts": 0,
         "critique_attempts": 0,

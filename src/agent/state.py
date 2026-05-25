@@ -22,6 +22,11 @@ class AgentState(TypedDict, total=False):
     # Selected build so far (category -> component dict)
     build: Optional[Dict[str, Any]]
 
+    # Snapshot of the previous build (set by feedback_handler on revisions).
+    # Used by the responder to produce a build-vs-build comparison section.
+    previous_build: Optional[Dict[str, Any]]
+    previous_budget_usd: Optional[float]
+
     # Compatibility issues from the most recent check
     compat_issues: List[Dict[str, Any]]
 

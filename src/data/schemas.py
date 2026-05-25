@@ -144,7 +144,8 @@ class Build(BaseModel):
 class Requirements(BaseModel):
     """Structured user requirements extracted by the gatherer node."""
     use_case: str = Field(description="Primary use case e.g. gaming, office, content_creation")
-    budget_usd: Optional[float] = Field(default=None, description="Total budget in USD")
+    budget_usd: Optional[float] = Field(default=None, description="Total budget in USD (upper bound if a range was given)")
+    budget_min_usd: Optional[float] = Field(default=None, description="Lower bound of a budget range, if user gave one")
     budget_flexible: bool = Field(default=False, description="Whether user is open to slight overspend")
     noise_preference: Optional[Literal["quiet", "balanced", "performance"]] = None
     form_factor_preference: Optional[Literal["mini_itx", "micro_atx", "atx", "any"]] = "any"
@@ -154,6 +155,7 @@ class Requirements(BaseModel):
     nice_to_have: List[str] = Field(default_factory=list)
     confidence: Literal["low", "medium", "high"] = "medium"
     clarifying_questions: List[str] = Field(default_factory=list)
+    is_on_topic: bool = Field(default=True, description="False when user's message is not about PCs")
 
 
 class Issue(BaseModel):

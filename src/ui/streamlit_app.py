@@ -134,13 +134,30 @@ def _llm_status():
     st.info(f"Provider: {provider}")
 
 
+GREETING = (
+    "Hi! I'm your **PC Builder Agent**.\n\n"
+    "Tell me what kind of PC you'd like and I'll design a compatible build "
+    "from the parts catalog. To get the best recommendation, share:\n\n"
+    "- **Use case** - gaming, office, content creation, workstation, home server\n"
+    "- **Budget** in USD - a single number (`$1500`) **or a range** (`$1200-$1500`)\n"
+    "- **Preferences** - form factor, noise level, AMD vs Intel, peripherals\n\n"
+    "Example: *\"Build me a 1440p gaming PC for $1200-$1500, preferably AMD, fairly quiet.\"*\n\n"
+    "After I propose a build, you can ask me to revise it - try:\n"
+    "- *\"make it cheaper\"*, *\"more storage\"*, *\"quieter\"*\n"
+    "- *\"swap the GPU for an NVIDIA card\"*\n"
+    "- *\"compare this with a $900 budget\"* (I'll show you what changes)\n"
+)
+
+
 def _ensure_session():
     if "thread_id" not in st.session_state:
         st.session_state.thread_id = f"streamlit-{uuid.uuid4().hex[:8]}"
     if "history" not in st.session_state:
-        st.session_state.history = []
+        st.session_state.history = [("assistant", GREETING)]
     if "build" not in st.session_state:
         st.session_state.build = {}
+    if "previous_build" not in st.session_state:
+        st.session_state.previous_build = {}
     if "processing" not in st.session_state:
         st.session_state.processing = False
 
@@ -166,8 +183,9 @@ def _render_sidebar():
         st.markdown("---")
         if st.button("Start a new build"):
             st.session_state.thread_id = f"streamlit-{uuid.uuid4().hex[:8]}"
-            st.session_state.history = []
+            st.session_state.history = [("assistant", GREETING)]
             st.session_state.build = {}
+            st.session_state.previous_build = {}
             st.session_state.processing = False
             st.rerun()
         st.markdown("---")
@@ -204,6 +222,43 @@ def _render_sidebar():
                         st.code(summarize_issues(issues))
             except Exception as e:
                 st.caption(f"(compatibility check skipped: {e})")
+
+        prev = st.session_state.get("previous_build") or {}
+        if prev and build:
+            st.markdown("---")
+            st.markdown("### Compared to previous build")
+            diff_rows = []
+            for cat in ("cpu", "motherboard", "memory", "video_card",
+                        "storage", "power_supply", "case", "cpu_cooler"):
+                old = prev.get(cat) or {}
+                nxt = build.get(cat) or {}
+                old_name = old.get("name")
+                nxt_name = nxt.get("name")
+                if old_name == nxt_name and old_name is not None:
+                    continue
+                old_price = float(old.get("price", 0) or 0)
+                nxt_price = float(nxt.get("price", 0) or 0)
+                delta = nxt_price - old_price
+                diff_rows.append({
+                    "Component": cat,
+                    "Was": f"{old_name or '-'} (${old_price:.0f})",
+                    "Now": f"{nxt_name or '-'} (${nxt_price:.0f})",
+                    "Δ": ("+" if delta >= 0 else "") + f"${delta:.0f}",
+                })
+            if diff_rows:
+                st.table(diff_rows)
+                old_total = sum(float((c or {}).get("price", 0) or 0)
+                                for c in prev.values())
+                new_total = sum(float((c or {}).get("price", 0) or 0)
+                                for c in build.values())
+                st.metric(
+                    "Total change",
+                    f"${new_total:.2f}",
+                    delta=f"{new_total - old_total:+.2f}",
+                )
+            else:
+                st.caption("No component changes vs previous build.")
+
         st.markdown("---")
         trace = current_trace_path()
         if trace:
@@ -216,6 +271,11 @@ def _run_agent(user_text: str) -> str:
     config = make_thread_config(st.session_state.thread_id)
     state_input = {"messages": [HumanMessage(content=user_text)]}
     result = graph.invoke(state_input, config=config)
+    # Track previous build for sidebar diff view (cleared automatically when
+    # the new build equals the previous one).
+    prev_build = result.get("previous_build")
+    if prev_build:
+        st.session_state.previous_build = prev_build
     st.session_state.build = result.get("build") or st.session_state.build
     msgs = result.get("messages") or []
     ai_msgs = [m for m in msgs if getattr(m, "type", "") == "ai"]
@@ -242,8 +302,8 @@ def main():
 
     st.title("PC Builder Agent")
     st.caption(
-        "Tell me what kind of PC you want - use case, budget, preferences. "
-        "I will design a compatible build."
+        "Open-source agentic AI that picks compatible PC parts from a fixed "
+        "catalog. Type your requirements below."
     )
 
     for role, content in st.session_state.history:
