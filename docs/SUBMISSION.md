@@ -53,8 +53,8 @@ In addition to the brief's requirements, the repo includes **10 dedicated stress
 
 ```powershell
 # 1. Clone + enter directory
-git clone https://github.com/Hrithik1205/PC-Build-Project.git
-cd PC-Build-Project
+git clone https://github.com/Hrithik1205/PC-Builder-Agent-Submission.git
+cd PC-Builder-Agent-Submission
 
 # 2. Install dependencies
 python -m venv .venv
@@ -540,4 +540,4 @@ Documented up-front so reviewers can verify our assumptions:
 
 ---
 
-*This document was generated alongside the codebase. The PDF version lives at [`docs/SUBMISSION.pdf`](SUBMISSION.pdf). The repo is hosted at https://github.com/Hrithik1205/PC-Build-Project.*
+*This document was generated alongside the codebase. The PDF version lives at [`docs/SUBMISSION.pdf`](SUBMISSION.pdf). The repo is hosted at https://github.com/Hrithik1205/PC-Builder-Agent-Submission.*
