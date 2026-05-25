@@ -421,12 +421,18 @@ Output ONLY a JSON object describing what to change:
 Examples:
 - "make it quieter" -> intent=swap_part, target_categories=["cpu_cooler","case"],
   delta_constraints={"noise_preference":"quiet"}.
+- "cheaper" / "make it cheaper" / "less expensive" (NO dollar amount) ->
+  intent=swap_part, delta_constraints={"price_lower": true}. DO NOT
+  invent a budget number when the user did not give one.
 - "cheaper, around $1000" -> intent=change_budget, delta_constraints={"budget_usd":1000}.
 - "make my budget $900 instead" -> intent=change_budget, delta_constraints={"budget_usd":900}.
 - "between $1000 and $1500" -> intent=change_budget, delta_constraints={"budget_usd":1500, "budget_min_usd":1000}.
 - "looks good, ship it" -> intent=approve.
 - "more storage" -> intent=swap_part, target_categories=["storage"],
   delta_constraints={"storage_capacity_gte":2000}.
+- "less expensive cpu" / "cheaper gpu" (category-specific) ->
+  intent=swap_part, target_categories=["cpu"],
+  delta_constraints={"price_lower_category":"cpu"}.
 - "compare this with a $900 build" or "show me what changes at $900" ->
   intent=compare_builds, delta_constraints={"budget_usd":900}.
 - "what's the weather", "tell me a joke", anything unrelated to PC builds ->
@@ -438,4 +444,6 @@ Notes:
   we re-plan and the responder will produce a comparison section
   automatically because the previous build is preserved. Use this intent
   ONLY when the user explicitly asks for a comparison.
+- NEVER invent a `budget_usd` value the user did not mention. If they say
+  only "cheaper" or "less expensive", emit `price_lower: true` instead.
 """

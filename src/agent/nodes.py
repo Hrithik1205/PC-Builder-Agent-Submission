@@ -2198,31 +2198,50 @@ def feedback_handler(state: AgentState) -> Dict[str, Any]:
         log.info("node.feedback.off_topic_heuristic")
         return {"final_response": OFF_TOPIC_REPLY, "mode": "respond"}
 
-    msgs = [
-        SystemMessage(content=FEEDBACK_SYSTEM),
-        HumanMessage(content=(
-            "Current build (summary):\n"
-            f"{json.dumps({k: v.get('name') for k, v in (state.get('build') or {}).items() if v}, indent=2)}\n\n"
-            "User feedback:\n"
-            f"{user_text}\n\n"
-            "Now produce the feedback JSON."
-        )),
-    ]
-    ai = invoke_with_retry(msgs, temperature=0.1)
-    fb = _parse_json_safely(ai.content) or {"intent": "unclear"}
-
-    # If the LLM bailed out as "unclear" (often because the small model
-    # produced non-JSON / truncated output), try to recover with a
-    # deterministic intent classifier on the raw text.
-    if fb.get("intent") in (None, "unclear"):
-        recovered = _heuristic_feedback(user_text)
-        if recovered:
+    # ---- Deterministic-first intent classification ----
+    # For short, canonical feedback phrases ("cheaper", "approve", "more
+    # storage", "increase budget to $X", "swap CPU with AMD", etc.) we trust
+    # our heuristic over the LLM. LLMs frequently hallucinate budget numbers
+    # for bare phrases like "cheaper" because they pattern-match against
+    # few-shot examples like "cheaper, around $1000" - we'd rather miss a
+    # nuanced phrasing than silently change the user's budget.
+    fb: Dict[str, Any] | None = None
+    if user_text and len(user_text.strip()) <= 80:
+        det = _heuristic_feedback(user_text)
+        if det:
+            fb = det
             log.info(
-                "node.feedback.heuristic_recovery",
-                original=fb.get("intent"),
-                recovered=recovered.get("intent"),
+                "node.feedback.heuristic_first",
+                intent=fb.get("intent"),
+                deltas=list((fb.get("delta_constraints") or {}).keys()),
             )
-            fb = recovered
+
+    if fb is None:
+        msgs = [
+            SystemMessage(content=FEEDBACK_SYSTEM),
+            HumanMessage(content=(
+                "Current build (summary):\n"
+                f"{json.dumps({k: v.get('name') for k, v in (state.get('build') or {}).items() if v}, indent=2)}\n\n"
+                "User feedback:\n"
+                f"{user_text}\n\n"
+                "Now produce the feedback JSON."
+            )),
+        ]
+        ai = invoke_with_retry(msgs, temperature=0.1)
+        fb = _parse_json_safely(ai.content) or {"intent": "unclear"}
+
+        # If the LLM bailed out as "unclear" (often because the small model
+        # produced non-JSON / truncated output), try to recover with a
+        # deterministic intent classifier on the raw text.
+        if fb.get("intent") in (None, "unclear"):
+            recovered = _heuristic_feedback(user_text)
+            if recovered:
+                log.info(
+                    "node.feedback.heuristic_recovery",
+                    original=fb.get("intent"),
+                    recovered=recovered.get("intent"),
+                )
+                fb = recovered
 
     log.info(
         "node.feedback.parsed",

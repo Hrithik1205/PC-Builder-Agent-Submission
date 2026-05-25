@@ -217,6 +217,7 @@ feedback_cases = [
     ("lower the budget to $600",         "change_budget"),
     # Cheaper
     ("make it cheaper",                  "swap_part"),
+    ("cheaper",                          "swap_part"),
     ("budget version",                   None),  # too vague
     # Quieter
     ("quieter please",                   "swap_part"),
@@ -240,6 +241,39 @@ for text, expected_intent in feedback_cases:
             got == expected_intent,
             f"expected {expected_intent}",
         )
+
+# Bare "cheaper" must NOT include a budget_usd in the deltas - that would
+# silently change the user's budget. It should set price_lower=True instead.
+print("\n== 'cheaper' must NOT invent a budget ==")
+fb = _heuristic_feedback("cheaper") or {}
+deltas = fb.get("delta_constraints") or {}
+check(
+    "bare 'cheaper' has no budget_usd delta",
+    "budget_usd" not in deltas,
+    f"got deltas={deltas}",
+)
+check(
+    "bare 'cheaper' sets price_lower=True",
+    deltas.get("price_lower") is True,
+    f"got deltas={deltas}",
+)
+
+fb2 = _heuristic_feedback("make it cheaper") or {}
+deltas2 = fb2.get("delta_constraints") or {}
+check(
+    "'make it cheaper' has no budget_usd delta",
+    "budget_usd" not in deltas2,
+    f"got deltas={deltas2}",
+)
+
+# Same for "less expensive" without a number
+fb3 = _heuristic_feedback("less expensive") or {}
+deltas3 = fb3.get("delta_constraints") or {}
+check(
+    "'less expensive' has no budget_usd delta",
+    "budget_usd" not in deltas3,
+    f"got deltas={deltas3}",
+)
 
 
 # ===========================================================================
